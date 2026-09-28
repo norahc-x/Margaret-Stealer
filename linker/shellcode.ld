@@ -19,6 +19,7 @@ SECTIONS
         __margaret_rodata_end = .;
         *(.text$F)
         *(.text$G)
+        *(.text$H)
         KEEP(*(.text$Z))
         __margaret_text_end = .;
     }

@@ -37,6 +37,7 @@ typedef struct MARGARET_ARGS {
     pic_u32 status;
     pic_u32 timeout_ms;
     pic_u32 flags;
+    pic_u32 pad; /* diagnostics: calibration stage marker (unused by ABI) */
 } MARGARET_ARGS;
 
 PIC_STATIC_ASSERT(sizeof(MARGARET_ARGS) == 0x30, "MARGARET_ARGS x64 ABI size");

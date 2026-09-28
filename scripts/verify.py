@@ -29,10 +29,10 @@ FORBIDDEN_SYMBOLS = {
 
 ALLOWED_OBJECT_SECTIONS = {
     ".text$A", ".text$B", ".text$C", ".text$D", ".text$E", ".text$F",
-    ".text$G", ".text$R", ".text$Z",
+    ".text$G", ".text$H", ".text$R", ".text$Z",
 }
 CODE_OBJECT_SECTIONS = {
-    ".text$A", ".text$B", ".text$C", ".text$D", ".text$E", ".text$F", ".text$G", ".text$Z",
+    ".text$A", ".text$B", ".text$C", ".text$D", ".text$E", ".text$F", ".text$G", ".text$H", ".text$Z",
 }
 ALLOWED_AMD64_RELOCATIONS = {
     "IMAGE_REL_AMD64_REL32",
@@ -49,6 +49,7 @@ EXPECTED_CODE_SECTION_BY_OBJECT = {
     "resolve.obj": [".text$D"],
     "adapter.obj": [".text$E", ".text$R"],
     "engine_a.obj": [".text$F"],
+    "cc_layout.obj": [".text$H"],
     "end_x64.obj": [".text$Z"],
 }
 

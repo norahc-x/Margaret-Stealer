@@ -30,6 +30,7 @@ OBJECTS := \
 	$(OBJ_DIR)/resolve.obj \
 	$(OBJ_DIR)/adapter.obj \
 	$(OBJ_DIR)/engine_a.obj \
+	$(OBJ_DIR)/cc_layout.obj \
 	$(OBJ_DIR)/end_x64.obj
 
 CPPFLAGS := -Iinclude
@@ -69,6 +70,8 @@ $(OBJ_DIR)/resolve.obj: src/resolve.c include/pic_resolve.h | $(OBJ_DIR)
 $(OBJ_DIR)/adapter.obj: src/adapter.c include/chromium_adapter.h include/pic_resolve.h include/margaret.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 $(OBJ_DIR)/engine_a.obj: src/engine_a.c include/margaret.h include/chromium_adapter.h include/pic_resolve.h | $(OBJ_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+$(OBJ_DIR)/cc_layout.obj: src/cc_layout.c include/cc_layout.h include/pic_resolve.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(TOOL_REPORT): | $(INSPECT_DIR)

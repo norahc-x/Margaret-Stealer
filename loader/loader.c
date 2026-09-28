@@ -584,8 +584,37 @@ int main(int argc, char **argv) {
     /* read results */
     if (!rp_read(proc, (uint64_t)(uintptr_t)r_args, &back, sizeof(back)))
         die("read args");
-    DBG("[loader] status=0x%X output_length=%u\n", back.status, back.output_length);
-    if (back.status != 0 || back.output_length == 0) goto cleanup;
+    DBG("[loader] status=0x%X output_length=%u flags=0x%X pad=0x%X\n",
+        back.status, back.output_length, back.flags, back.pad);
+    if (back.status != 0) {
+        uint8_t hdr[32];
+        if (back.output_length >= 32 &&
+            rp_read(proc, (uint64_t)(uintptr_t)r_out, hdr, 32)) {
+            uint64_t se = 0, lh = 0;
+            for (int i = 7; i >= 0; i--) se = (se << 8) | hdr[12 + i];
+            for (int i = 7; i >= 0; i--) lh = (lh << 8) | hdr[20 + i];
+            DBG("[loader] MCEA scan_end=0x%llX last_hit=0x%llX\n",
+                (unsigned long long)se, (unsigned long long)lh);
+        }
+        if (back.output_length > 32) {
+            uint32_t dl = back.output_length - 32u;
+            uint8_t *db;
+            if (dl > 0x240u) dl = 0x240u;
+            db = malloc(dl);
+            if (db && rp_read(proc, (uint64_t)(uintptr_t)r_out + 32u,
+                              db, dl)) {
+                for (uint32_t i = 0; i < dl; i += 16) {
+                    printf("%03X: ", i);
+                    for (uint32_t j = 0; j < 16 && i + j < dl; j++)
+                        printf("%02X ", db[i + j]);
+                    printf("\n");
+                }
+            }
+            free(db);
+        }
+        goto cleanup;
+    }
+    if (back.output_length == 0) goto cleanup;
 
     uint8_t *out = malloc(back.output_length);
     if (!out || !rp_read(proc, (uint64_t)(uintptr_t)r_out, out, back.output_length))
