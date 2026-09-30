@@ -289,8 +289,17 @@ static PIC_CODE pic_bool adapter_discover_deobfuscator(
         for (i = 0u; i < used; i++) {
             if (tally[i].count == best) {
                 const pic_u8 *fn = base + tally[i].rva;
-                if (fn[0] == 0xC3u || fn[0] == 0xCCu) {
-                    return PIC_FALSE; /* ret/int3 stub: junk target */
+                /* family prologue gate: the real Value() opens with
+                 * push r15/r14/r13/r12 (41 57 41 56 41 55 41 54).
+                 * Replaces the old first-byte ret/int3 junk filter,
+                 * which any non-stub wrong winner passed.  The call
+                 * target was validated inside .text when tallied, so
+                 * fn[0..7] cannot leave the mapped section. */
+                if (fn[0] != 0x41u || fn[1] != 0x57u ||
+                    fn[2] != 0x41u || fn[3] != 0x56u ||
+                    fn[4] != 0x41u || fn[5] != 0x55u ||
+                    fn[6] != 0x41u || fn[7] != 0x54u) {
+                    return PIC_FALSE; /* wrong prologue: not Value() */
                 }
                 *out_deobf_rva = tally[i].rva;
                 return PIC_TRUE;

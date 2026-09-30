@@ -428,10 +428,25 @@ def gate_raw(args: argparse.Namespace) -> None:
     def in_rodata(offset: int) -> bool:
         return rodata[0] <= offset < rodata[1]
 
-    raw_disassembly = run([
-        args.objdump, "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
-        str(blob),
-    ])
+    # Disassemble each CODE window separately.  The .text$R data island
+    # desynchronizes a linear decode: bytes after the island decode with
+    # a random phase and a real movabs there renders as operand noise
+    # (verified by injecting one).  Both island edges are section-group
+    # starts -- true instruction boundaries -- so per-window decode is
+    # correctly synchronized for every instruction the checks below see.
+    if rodata[0] > 0:
+        windows = [(0, rodata[0]), (rodata[1], len(blob_bytes))]
+    else:
+        windows = [(0, len(blob_bytes))]
+    parts = []
+    for start, stop in windows:
+        parts.append(f"; code window [0x{start:x}, 0x{stop:x})\n")
+        parts.append(run([
+            args.objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
+            "-M", "intel", f"--start-address={start}",
+            f"--stop-address={stop}", str(blob),
+        ]))
+    raw_disassembly = "".join(parts)
     linked_disassembly = run([args.objdump, "-d", "-M", "intel", str(image)])
     write_text(inspect / "raw-disassembly.txt", raw_disassembly)
     write_text(inspect / "linked-disassembly.txt", linked_disassembly)
@@ -445,6 +460,15 @@ def gate_raw(args: argparse.Namespace) -> None:
             continue
         absolute_candidates.append(line)
 
+    # Fail-closed: a position-independent blob must contain no absolute
+    # immediates or absolute memory operands outside the declared rodata
+    # window.  Pure 64-bit constants would also trip this -- every hit
+    # must be traced and justified, so the gate stops the build instead
+    # of silently counting (the expected baseline is zero).
+    ensure(not absolute_candidates,
+           "raw blob contains absolute immediates/memory operands "
+           f"(expected none, got {len(absolute_candidates)}): "
+           f"{absolute_candidates[:5]}")
     branches = direct_branch_targets(raw_disassembly)
     out_of_range = [
         {"source": source, "mnemonic": mnemonic, "target": target}

@@ -7,9 +7,10 @@
 .extern margaret_blob_end
 
 /*
- * Margaret x64 shellcode ABI:
- *   RCX = MARGARET_ARGS* (may be NULL; C returns BAD_ARGUMENT)
- *   RAX = MARGARET_STATUS
+ * Entry precondition: the blob MUST be entered by CALL (RSP % 16 == 8
+ * at margaret_entry); the shipped loader trampoline guarantees it.
+ * A delivery that JMPs in with RSP % 16 == 0 misaligns every callee
+ * and faults on the first aligned SSE access inside resolved code.
  *
  * The C function follows the Windows x64 ABI.  This stub preserves every
  * nonvolatile GPR it touches/potentially exposes and reserves 32 bytes of

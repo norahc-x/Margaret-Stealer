@@ -6,6 +6,13 @@
 #define MARGARET_ARGUMENT_MAGIC 0x4752414Du /* "MARG" little-endian */
 #define MARGARET_RESULT_MAGIC   0x544C5352u /* "RSLT" little-endian */
 #define MARGARET_ABI_VERSION    1u
+
+/* Blob entry ABI (asm/entry_x64.s):
+ *   - the blob is entered by CALL: RSP % 16 == 8 at margaret_entry,
+     RCX = MARGARET_ARGS*, return RAX = MARGARET_STATUS;
+ *   - the shipped loader trampoline satisfies the alignment; a
+ *     JMP-entry delivery with RSP % 16 == 0 misaligns callees and
+ *     faults inside resolved code. */
 #define MARGARET_ARCH_X64       0x8664u
 
 typedef enum MARGARET_OPERATION {
@@ -96,6 +103,18 @@ typedef struct MARGARET_ADAPTER_RESULT {
 
 PIC_STATIC_ASSERT(sizeof(MARGARET_ADAPTER_RESULT) == 0x20,
                   "adapter result ABI size");
+
+/* Engine A snapshot output format (single source for blob + loader):
+ *   [0..3]   magic "MCEA" (little-endian)
+ *   [4..7]   cookie_count
+ *   [8..11]  instance_count
+ *   [12..19] scan-end address, [20..27] last-hit address (diagnostics)
+ *   [28..31] reserved
+ *   [32..]   serialized cookies: [name_len][name][domain_len][domain]
+ *            [path_len][path][value_len][value][creation(8)][expiry(8)]
+ *            [flags(4)][same_site(4)][port(4)] */
+#define MARGARET_ENGINE_A_MAGIC 0x4145434Du /* "MCEA" little-endian */
+
 
 /* Engine A: vtable-anchored CookieMonster discovery + cookie snapshot.
  * Implemented in src/engine_a.c (.text$F).  Requires a selected adapter

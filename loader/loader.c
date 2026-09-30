@@ -8,22 +8,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include "margaret.h"   /* blob ABI: MARGARET_ARGS + magics, single source */
 #include "lstrings.h"
 
-#define MG_ARG_MAGIC   0x4752414Du
-#define MG_ABI_VERSION 1u
-#define MG_OP_SNAPSHOT 2u
 #define MG_TIMEOUT_MS  60000u
 #define MG_OUT_CAP     (8u * 1024u * 1024u)
-#define MCEA_MAGIC     0x4145434Du
-
-#pragma pack(push, 1)
-typedef struct MG_ARGS {
-    uint32_t size; uint32_t version; uint32_t magic; uint32_t operation;
-    uint64_t output_buffer; uint32_t output_capacity; uint32_t output_length;
-    uint32_t status; uint32_t timeout_ms; uint32_t flags; uint32_t pad;
-} MG_ARGS;
-#pragma pack(pop)
 
 #ifdef LOADER_VERBOSE
 #define DBG(...) printf(__VA_ARGS__)
@@ -456,7 +445,7 @@ int main(int argc, char **argv) {
     long blob_size;
     HANDLE proc, victim = NULL;
     uint8_t *r_blob, *r_args, *r_out;
-    MG_ARGS args, back;
+    MARGARET_ARGS args, back;
     SIZE_T written = 0;
 
     int test_mode = (argc >= 2 && strcmp(argv[1], "--test") == 0);
@@ -527,10 +516,10 @@ int main(int argc, char **argv) {
 
     memset(&args, 0, sizeof(args));
     args.size = sizeof(args);
-    args.version = MG_ABI_VERSION;
-    args.magic = MG_ARG_MAGIC;
-    args.operation = MG_OP_SNAPSHOT;
-    args.output_buffer = (uint64_t)(uintptr_t)r_out;
+    args.version = MARGARET_ABI_VERSION;
+    args.magic = MARGARET_ARGUMENT_MAGIC;
+    args.operation = MARGARET_OP_SNAPSHOT_DEFAULT_PROFILE;
+    args.output_buffer = r_out;
     args.output_capacity = MG_OUT_CAP;
     args.timeout_ms = MG_TIMEOUT_MS;
     args.status = MG_STATUS_SENTINEL;  /* blob clears this on completion */

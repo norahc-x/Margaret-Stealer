@@ -152,13 +152,14 @@ clean:
 
 loader: loader/loader.exe
 
-loader/loader.exe: loader/loader.c loader/lstrings.h
-	x86_64-w64-mingw32-gcc -O2 -Wall -s -fno-ident -o $@ loader/loader.c
+LOADER_HEADERS := include/margaret.h include/pic_resolve.h include/pic_hash_table.h
+
+loader/loader.exe: loader/loader.c loader/lstrings.h $(LOADER_HEADERS)
+	x86_64-w64-mingw32-gcc -O2 -Wall -Iinclude -s -fno-ident -o $@ loader/loader.c
 	python3 scripts/strip_idents.py $@
 
-loader-verbose: loader/loader.c loader/lstrings.h
-	x86_64-w64-mingw32-gcc -O2 -Wall -DLOADER_VERBOSE -o loader/loader-verbose.exe loader/loader.c
-
+loader-verbose: loader/loader.c loader/lstrings.h $(LOADER_HEADERS)
+	x86_64-w64-mingw32-gcc -O2 -Wall -Iinclude -DLOADER_VERBOSE -o loader/loader-verbose.exe loader/loader.c
 # loader strings-gate: nessuna stringa rivelatrice nel .exe (quiet build)
 loader-gate: loader/loader.exe
 	@w=$$(strings -e l loader/loader.exe | grep -icE "chrome|utility|network" || true); \

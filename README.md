@@ -75,4 +75,8 @@ Windows 11 24H2 x64 is the validated matrix.
 - Discovery relies on two compiler invariants (the method-name string and the value-read shape); a future Chrome refactor that breaks either fails closed with `UNSUPPORTED_BUILD`.
 - secure/httponly are calibrated by RFC 6265bis name-prefix evidence (`__Secure-`, `__Host-` force Secure); when the vote does not converge the flags serialize as 0 and the prefix rules still hold.
 - No CDP, no DPAPI/ABE attack, no persistence, no C2 — by design.
+- **Per-value heap leak (accepted cost):** each de-obfuscated long value (>22 bytes — the common case) leaves one `std::string` heap allocation behind in the network utility process (the sret buffer is never destroyed). The footprint is bounded by the cookie count and dies with the process; proper teardown would need a third discovered anchor (the string destructor).
+- **Timeout granularity:** the scan timeout is evaluated between `VirtualQuery` regions; a single region's inner scan (max 256 MB) cannot be interrupted, so the effective bound can overshoot `timeout_ms` by seconds. Committed regions larger than 256 MB are scanned only up to that bound.
+- **Hijack-point risk:** the victim thread is suspended at an arbitrary point. If it holds an allocator lock or the per-process key lock that the de-obfuscator's path re-acquires, the call deadlocks — the loader timeout observes it, but the thread stays wedged. Thread selection maximizes stack headroom, not lock safety.
+- **No unwind across the blob:** unwind metadata is deliberately absent. If resolved Chrome code ever throws (e.g. `bad_alloc` on a long value), unwinding cannot cross the blob's frames and the process crashes. `ProcessBound::Value()` is not expected to throw; the risk is documented, not handled.
 

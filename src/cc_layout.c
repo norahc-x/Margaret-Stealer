@@ -366,6 +366,11 @@ PIC_CODE pic_bool margaret_cc_calibrate(
      * non-printable in at least one cookie (v20 ciphertext). */
     off_value = 0u;
     k = 0u;
+    /* 0x128 ceiling: the value block has landed below 0x128 in every
+     * validated build (152-156) -- it is the current CanonicalCookie
+     * size bound, not a struct guarantee.  A rebuild that moves the
+     * value past it finds no candidate here and the whole calibration
+     * fails closed at step 5 (UNSUPPORTED_BUILD), never a misread. */
     for (o = off_path + 0x18u; o < 0x128u; o += 8u) {
         pic_u8 any_ct = 0u;
         cnt = 0u;
