@@ -2,7 +2,6 @@
 
 **Margaret** is a compact, position-independent x64 shellcode that extracts cookies — with fully de-obfuscated values — from a live Chrome *network utility* process. It walks the in-memory cookie store and invokes Chrome's own per-process de-obfuscation routine, so plaintext values are recovered by the process itself: no disk access, no DevTools, no attack on at-rest encryption (DPAPI / App-Bound).
 
-Margaret is a **capability, not an implant**: no C2 endpoint, no persistence, no network code, no strings.
 
 > I designed this stealer to be C2-agnostic — red teams and researchers should adapt it to their specific needs and frameworks. The delivery is yours.
 
@@ -12,10 +11,10 @@ Margaret is a **capability, not an implant**: no C2 endpoint, no persistence, no
 
 | Component | Role |
 |---|---|
-| `src/`, `asm/`, `linker/` | The blob: freestanding C + a minimal entry stub, linked as a single ordered `.text` with strict static gates. Zero imports, zero strings, zero writable globals; every API is resolved at runtime by dual-32 hashing. |
-| `src/adapter.c` | **Runtime discovery** — the blob self-locates the two anchors it needs by byte-pattern chains on the live module; no per-build table ships in the blob. |
-| `loader/` | The delivery component: a standalone injector via thread-context hijacking. Has its own [README](loader/README.md). Swap it for your own — the blob is delivery-agnostic. |
-| `scripts/` + gates | Deterministic build pipeline: three static gates (objects / linked image / raw blob) abort the build on any violation; compile-time needle encryption; reproducible output. |
+| `src/`, `asm/`, `linker/` | core shellcode implementation |
+| `src/adapter.c` | self-locates the two anchors it needs by byte-pattern chains on the live module. |
+| `loader/` | standalone injector via thread-context hijacking |
+| `scripts/` + gates | utility scripts. |
 
 Building (Linux host, MinGW-w64 cross toolchain):
 
@@ -29,7 +28,7 @@ make loader-verbose # dev loader with diagnostics
 
 The network utility process keeps every cookie in RAM inside `CookieMonster` objects; since recent versions, the values are stored encrypted with a **process-bound key** that never touches disk. Margaret reaches them by:
 
-1. **Reverse engineering** pinned builds (Ghidra for structure, x64dbg hardware breakpoints to catch Chrome de-obfuscating a live value) identified two anchors: the `CookieMonster` vtable and Chrome's de-obfuscation function (`crypto::ProcessBound<std::string>::value()`).
+1. **Reverse engineering** pinned builds identified two anchors: the `CookieMonster` vtable and Chrome's de-obfuscation function (`crypto::ProcessBound<std::string>::value()`).
 2. Locating them **without per-build tables** meant finding what recompilation cannot change. Two compiler invariants, located at runtime by byte-pattern scanning, carry the whole approach:
    - **String-pattern search** — every build contains exactly one copy of the method-name string `CookieMonster::GetCookieListWithOptionsAsync`, referenced by exactly one piece of code. That code lives inside the method itself, and the method occupies a fixed vtable slot: string → code reference → function → slot index, so the vtable is located without ever being memorized.
    - **Code-shape matching** — every value read performs the same three-step gesture. The canonical site, as compiled inside Chrome's value accessor:
