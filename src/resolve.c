@@ -1,873 +1,836 @@
-#define PIC_CODE_SECTION_NAME ".text$D"
-#include "pic_resolve.h"
+#define CODE_SECTION_NAME ".text$D"
+#include "resolve.h"
 
 /*
- * Resolver implementation notes
- * =============================
- * - Every PE/API-set field is read byte-wise (pic_read_u16/pic_read_u32) at
- *   offsets taken from the asserted structures in pic_resolve.h.  No
- *   structure pointer is ever formed into a mapped image or into the
- *   API-set schema: those bytes are not guaranteed to be aligned, and this
- *   also keeps -Wcast-align=strict clean.  x64 is little-endian only.
- * - Every loop is bounded by the PIC_* limits in pic_resolve.h.
- * - Forwarded exports: recursion depth lives in ctx->forward_depth and is
- *   checked before each hop; cycles are detected by the visited-stack of
- *   forwarder-string hashes in ctx->forward_visited.
- * - API-set parsing is isolated in this file and pinned to schema
- *   version 6; any other version fails closed.
- * - The module cache in ctx->modules memoizes Ldr lookups by name hash.
- *   Modules are assumed not to unload for the duration of one operation
- *   (snapshot semantics); the assumption is documented in docs/.
+ * Byte-read PE/API-set parsing for x64. All traversals are bounded.
+ * Forwarders use depth and cycle guards; API-set schema v6 fails closed.
+ * Module-cache entries remain valid for one operation.
  */
 
-static PIC_CODE pic_u16 pic_read_u16(const pic_u8 *data)
+static CODE_SECTION WORD ReadU16(const BYTE *data)
 {
-    return (pic_u16)((pic_u16)data[0] | ((pic_u16)data[1] << 8u));
+    return (WORD)((WORD)data[0] | ((WORD)data[1] << 8u));
 }
 
-static PIC_CODE pic_u32 pic_read_u32(const pic_u8 *data)
+static CODE_SECTION DWORD ReadU32(const BYTE *data)
 {
-    return (pic_u32)((pic_u32)data[0] |
-                     ((pic_u32)data[1] << 8u) |
-                     ((pic_u32)data[2] << 16u) |
-                     ((pic_u32)data[3] << 24u));
+    return (DWORD)((DWORD)data[0] |
+                     ((DWORD)data[1] << 8u) |
+                     ((DWORD)data[2] << 16u) |
+                     ((DWORD)data[3] << 24u));
 }
 
-/* pic_u8 ASCII a-z -> A-Z fold. */
-static PIC_CODE pic_bool pic_hash_equal(const PIC_HASH *a, const PIC_HASH *b)
+/* Compare both hash words. */
+static CODE_SECTION BOOL HashEqual(const API_HASH *a, const API_HASH *b)
 {
-    return (a->fnv == b->fnv && a->djb == b->djb) ? PIC_TRUE : PIC_FALSE;
+    return (a->Fnv == b->Fnv && a->Djb == b->Djb) ? TRUE : FALSE;
 }
 
-static PIC_CODE pic_bool pic_hash_is_zero(const PIC_HASH *h)
+static CODE_SECTION BOOL HashIsZero(const API_HASH *h)
 {
-    return (h->fnv == 0u && h->djb == 0u) ? PIC_TRUE : PIC_FALSE;
+    return (h->Fnv == 0u && h->Djb == 0u) ? TRUE : FALSE;
 }
 
-static PIC_CODE pic_u8 pic_fold_u8(pic_u8 value)
+static CODE_SECTION BYTE FoldU8(BYTE value)
 {
-    if (value >= (pic_u8)'a' && value <= (pic_u8)'z') {
-        return (pic_u8)(value - ((pic_u8)'a' - (pic_u8)'A'));
+    if (value >= (BYTE)'a' && value <= (BYTE)'z') {
+        return (BYTE)(value - ((BYTE)'a' - (BYTE)'A'));
     }
     return value;
 }
 
-/* pic_u16 ASCII a-z -> A-Z fold. */
-static PIC_CODE pic_u16 pic_fold_u16(pic_u16 value)
+/* Fold ASCII a-z to A-Z in one UTF-16 unit. */
+static CODE_SECTION WORD FoldU16(WORD value)
 {
-    if (value >= (pic_u16)'a' && value <= (pic_u16)'z') {
-        return (pic_u16)(value - ((pic_u16)'a' - (pic_u16)'A'));
+    if (value >= (WORD)'a' && value <= (WORD)'z') {
+        return (WORD)(value - ((WORD)'a' - (WORD)'A'));
     }
     return value;
 }
 
-static PIC_CODE pic_bool pic_range_within(pic_u32 offset, pic_u32 length, pic_u32 limit)
+static CODE_SECTION BOOL RangeWithin(DWORD offset, DWORD length, DWORD limit)
 {
-    pic_u64 end = (pic_u64)offset + (pic_u64)length;
-    return end <= (pic_u64)limit ? PIC_TRUE : PIC_FALSE;
+    ULONGLONG end = (ULONGLONG)offset + (ULONGLONG)length;
+    return end <= (ULONGLONG)limit ? TRUE : FALSE;
 }
 
-static PIC_CODE PIC_RESOLVE_STATUS pic_fail(PIC_CONTEXT *ctx, PIC_RESOLVE_STATUS code)
+static CODE_SECTION RESOLVE_STATUS Fail(RESOLVER_CONTEXT *ctx, RESOLVE_STATUS code)
 {
-    ctx->last_error = (pic_u32)code;
+    ctx->LastError = (DWORD)code;
     return code;
 }
 
-/* Field offsets inside a mapped image, expressed through the asserted
- * structures in pic_resolve.h. */
-#define PIC_NT_FILE_OFF(field) \
-    ((pic_u32)PIC_OFFSETOF(PIC_IMAGE_NT_HEADERS64, FileHeader) + \
-     (pic_u32)PIC_OFFSETOF(PIC_IMAGE_FILE_HEADER, field))
-#define PIC_NT_OPT_OFF(field) \
-    ((pic_u32)PIC_OFFSETOF(PIC_IMAGE_NT_HEADERS64, OptionalHeader) + \
-     (pic_u32)PIC_OFFSETOF(PIC_IMAGE_OPTIONAL_HEADER64, field))
-#define PIC_EXP_OFF(field) \
-    ((pic_u32)PIC_OFFSETOF(PIC_IMAGE_EXPORT_DIRECTORY, field))
+/* Offsets into asserted mapped-image views. */
+#define NT_FILE_OFF(field) \
+    ((DWORD)offsetof(IMAGE_NT_HEADERS64, FileHeader) + \
+     (DWORD)offsetof(IMAGE_FILE_HEADER, field))
+#define NT_OPT_OFF(field) \
+    ((DWORD)offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + \
+     (DWORD)offsetof(IMAGE_OPTIONAL_HEADER64, field))
+#define EXP_OFF(field) \
+    ((DWORD)offsetof(IMAGE_EXPORT_DIRECTORY, field))
 
-/* NT headers always begin inside the first page of a mapped image. */
-#define PIC_PE_MAX_E_LFANEW 0x1000u
+/* NT headers must start in the first page. */
+#define PE_MAX_E_LFANEW 0x1000u
 
-/*
- * Validate a mapped x64 PE image and return its size plus the export
- * directory bounds.  Checks: DOS/NT signatures, machine type, PE32+
- * optional-header magic, NumberOfRvaAndSizes covers the export entry,
- * non-zero SizeOfImage, and an export directory fully inside the image.
- */
-static PIC_CODE PIC_RESOLVE_STATUS pic_validate_image(void *module_base,
-                                              pic_u32 *image_size,
-                                              pic_u32 *export_rva,
-                                              pic_u32 *export_size)
+/* Validate a mapped PE32+ image and return image/export bounds. */
+static CODE_SECTION RESOLVE_STATUS ValidateImage(PVOID moduleBase,
+                                              PDWORD imageSize,
+                                              PDWORD exportRva,
+                                              PDWORD exportSize)
 {
-    const pic_u8 *base = (const pic_u8 *)module_base;
-    pic_u32 lfanew;
-    pic_u32 number_of_rva;
-    pic_u32 size_of_image;
-    pic_u32 directory_offset;
+    const BYTE *base = (const BYTE *)moduleBase;
+    DWORD lfanew;
+    DWORD numberOfRva;
+    DWORD sizeOfImage;
+    DWORD directoryOffset;
 
-    if (pic_read_u16(base) != PIC_IMAGE_DOS_SIGNATURE) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    if (ReadU16(base) != IMAGE_DOS_SIGNATURE) {
+        return ResolveStatusBadImage;
     }
-    lfanew = (pic_u32)pic_read_u32(
-        base + (pic_u32)PIC_OFFSETOF(PIC_IMAGE_DOS_HEADER, e_lfanew));
-    if (lfanew < (pic_u32)sizeof(PIC_IMAGE_DOS_HEADER) ||
-        lfanew > PIC_PE_MAX_E_LFANEW - (pic_u32)sizeof(PIC_IMAGE_NT_HEADERS64) ||
+    lfanew = (DWORD)ReadU32(
+        base + (DWORD)offsetof(IMAGE_DOS_HEADER, e_lfanew));
+    if (lfanew < (DWORD)sizeof(IMAGE_DOS_HEADER) ||
+        lfanew > PE_MAX_E_LFANEW - (DWORD)sizeof(IMAGE_NT_HEADERS64) ||
         (lfanew & 3u) != 0u) {
-        return PIC_RESOLVE_BAD_IMAGE;
+        return ResolveStatusBadImage;
     }
-    if (pic_read_u32(base + lfanew) != PIC_IMAGE_NT_SIGNATURE) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    if (ReadU32(base + lfanew) != IMAGE_NT_SIGNATURE) {
+        return ResolveStatusBadImage;
     }
-    if (pic_read_u16(base + lfanew + PIC_NT_FILE_OFF(Machine)) !=
-        PIC_IMAGE_FILE_MACHINE_AMD64) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    if (ReadU16(base + lfanew + NT_FILE_OFF(Machine)) !=
+        IMAGE_FILE_MACHINE_AMD64) {
+        return ResolveStatusBadImage;
     }
-    if (pic_read_u16(base + lfanew + PIC_NT_OPT_OFF(Magic)) !=
-        PIC_IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    if (ReadU16(base + lfanew + NT_OPT_OFF(Magic)) !=
+        IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return ResolveStatusBadImage;
     }
-    number_of_rva = pic_read_u32(base + lfanew + PIC_NT_OPT_OFF(NumberOfRvaAndSizes));
-    if (number_of_rva <= PIC_IMAGE_DIRECTORY_ENTRY_EXPORT) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    numberOfRva = ReadU32(base + lfanew + NT_OPT_OFF(NumberOfRvaAndSizes));
+    if (numberOfRva <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        return ResolveStatusBadImage;
     }
-    size_of_image = pic_read_u32(base + lfanew + PIC_NT_OPT_OFF(SizeOfImage));
-    if (size_of_image == 0u) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    sizeOfImage = ReadU32(base + lfanew + NT_OPT_OFF(SizeOfImage));
+    if (sizeOfImage == 0u) {
+        return ResolveStatusBadImage;
     }
 
-    directory_offset = lfanew + PIC_NT_OPT_OFF(DataDirectory) +
-                       PIC_IMAGE_DIRECTORY_ENTRY_EXPORT *
-                           (pic_u32)sizeof(PIC_IMAGE_DATA_DIRECTORY);
-    *export_rva = pic_read_u32(base + directory_offset);
-    *export_size = pic_read_u32(base + directory_offset + 4u);
-    if (*export_rva == 0u ||
-        *export_size < (pic_u32)sizeof(PIC_IMAGE_EXPORT_DIRECTORY) ||
-        !pic_range_within(*export_rva, *export_size, size_of_image)) {
-        return PIC_RESOLVE_BAD_IMAGE;
+    directoryOffset = lfanew + NT_OPT_OFF(DataDirectory) +
+                       IMAGE_DIRECTORY_ENTRY_EXPORT *
+                           (DWORD)sizeof(IMAGE_DATA_DIRECTORY);
+    *exportRva = ReadU32(base + directoryOffset);
+    *exportSize = ReadU32(base + directoryOffset + 4u);
+    if (*exportRva == 0u ||
+        *exportSize < (DWORD)sizeof(IMAGE_EXPORT_DIRECTORY) ||
+        !RangeWithin(*exportRva, *exportSize, sizeOfImage)) {
+        return ResolveStatusBadImage;
     }
-    *image_size = size_of_image;
-    return PIC_RESOLVE_OK;
+    *imageSize = sizeOfImage;
+    return ResolveStatusOk;
 }
 
-#define PIC_NAME_INVALID 0xFFFFFFFFu
+#define NAME_INVALID 0xFFFFFFFFu
 
-/*
- * Bounded scan for a NUL-terminated ASCII string at name_rva.  Returns the
- * length without the terminator, or PIC_NAME_INVALID when the rva is out of
- * bounds, the string is empty, or no terminator appears within the smaller
- * of the image and PIC_MAX_EXPORT_NAME_BYTES.
- */
-static PIC_CODE pic_u32 pic_scan_ascii_name(const pic_u8 *base,
-                                    pic_u32 image_size,
-                                    pic_u32 name_rva)
+/* Return a bounded export-name length, or NAME_INVALID. */
+static CODE_SECTION DWORD ScanAsciiName(const BYTE *base,
+                                    DWORD imageSize,
+                                    DWORD nameRva)
 {
-    pic_u32 limit;
-    pic_u32 index;
+    DWORD limit;
+    DWORD index;
 
-    if (name_rva == 0u || name_rva >= image_size) {
-        return PIC_NAME_INVALID;
+    if (nameRva == 0u || nameRva >= imageSize) {
+        return NAME_INVALID;
     }
-    limit = image_size - name_rva;
-    if (limit > PIC_MAX_EXPORT_NAME_BYTES) {
-        limit = PIC_MAX_EXPORT_NAME_BYTES;
+    limit = imageSize - nameRva;
+    if (limit > MAX_EXPORT_NAME_BYTES) {
+        limit = MAX_EXPORT_NAME_BYTES;
     }
     for (index = 0u; index < limit; ++index) {
-        if (base[name_rva + index] == 0u) {
-            return index == 0u ? PIC_NAME_INVALID : index;
+        if (base[nameRva + index] == 0u) {
+            return index == 0u ? NAME_INVALID : index;
         }
     }
-    return PIC_NAME_INVALID;
+    return NAME_INVALID;
 }
 
-/*
- * Shared completion for export lookups: a non-forwarded RVA resolves
- * directly; an RVA inside the export directory range is a forwarder string
- * and recurses through pic_resolve_forwarder with depth and cycle checks.
- */
-static PIC_CODE PIC_RESOLVE_STATUS pic_export_finish(PIC_CONTEXT *ctx,
-                                            const pic_u8 *base,
-                                            pic_u32 image_size,
-                                            pic_u32 dir_rva,
-                                            pic_u32 dir_size,
-                                            pic_u32 function_rva,
-                                            void **address)
+/* Resolve an export RVA directly or through a guarded forwarder chain. */
+static CODE_SECTION RESOLVE_STATUS ExportFinish(RESOLVER_CONTEXT *ctx,
+                                            const BYTE *base,
+                                            DWORD imageSize,
+                                            DWORD dirRva,
+                                            DWORD dirSize,
+                                            DWORD functionRva,
+                                            PVOID*address)
 {
-    if (function_rva == 0u) {
-        return pic_fail(ctx, PIC_RESOLVE_EXPORT_NOT_FOUND);
+    if (functionRva == 0u) {
+        return Fail(ctx, ResolveStatusExportNotFound);
     }
-    if (function_rva >= image_size) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+    if (functionRva >= imageSize) {
+        return Fail(ctx, ResolveStatusBadImage);
     }
 
-    if ((pic_u64)function_rva >= (pic_u64)dir_rva &&
-        (pic_u64)function_rva < (pic_u64)dir_rva + (pic_u64)dir_size) {
-        PIC_RESOLVE_STATUS status;
-        pic_u32 forwarder_length;
-        pic_u32 depth;
-        PIC_HASH visited_hash;
-        pic_u32 index;
+    if ((ULONGLONG)functionRva >= (ULONGLONG)dirRva &&
+        (ULONGLONG)functionRva < (ULONGLONG)dirRva + (ULONGLONG)dirSize) {
+        RESOLVE_STATUS status;
+        DWORD forwarderLength;
+        DWORD depth;
+        API_HASH visitedHash;
+        DWORD index;
 
-        forwarder_length = pic_scan_ascii_name(base, image_size, function_rva);
-        if (forwarder_length == PIC_NAME_INVALID) {
-            return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+        forwarderLength = ScanAsciiName(base, imageSize, functionRva);
+        if (forwarderLength == NAME_INVALID) {
+            return Fail(ctx, ResolveStatusBadImage);
         }
 
-        depth = ctx->forward_depth + 1u;
-        if (depth > PIC_MAX_FORWARD_DEPTH) {
-            return pic_fail(ctx, PIC_RESOLVE_FORWARD_DEPTH);
+        depth = ctx->ForwardDepth + 1u;
+        if (depth > MAX_FORWARD_DEPTH) {
+            return Fail(ctx, ResolveStatusForwardDepth);
         }
 
-        pic_hash_ascii_upper(base + function_rva, forwarder_length,
-                             &visited_hash);
-        for (index = 0u; index < ctx->forward_visited_count; ++index) {
-            if (pic_hash_equal(&ctx->forward_visited[index], &visited_hash) == PIC_TRUE) {
-                return pic_fail(ctx, PIC_RESOLVE_FORWARD_CYCLE);
+        HashAsciiUpper(base + functionRva, forwarderLength,
+                             &visitedHash);
+        for (index = 0u; index < ctx->ForwardVisitedCount; ++index) {
+            if (HashEqual(&ctx->ForwardVisited[index], &visitedHash) == TRUE) {
+                return Fail(ctx, ResolveStatusForwardCycle);
             }
         }
-        if (ctx->forward_visited_count >= PIC_MAX_FORWARD_VISITED) {
-            return pic_fail(ctx, PIC_RESOLVE_BOUND_EXCEEDED);
+        if (ctx->ForwardVisitedCount >= MAX_FORWARD_VISITED) {
+            return Fail(ctx, ResolveStatusBoundExceeded);
         }
-        ctx->forward_visited[ctx->forward_visited_count] = visited_hash;
-        ctx->forward_visited_count += 1u;
-        ctx->forward_depth = depth;
+        ctx->ForwardVisited[ctx->ForwardVisitedCount] = visitedHash;
+        ctx->ForwardVisitedCount += 1u;
+        ctx->ForwardDepth = depth;
 
-        status = pic_resolve_forwarder(ctx,
-                                       (const char *)(base + function_rva),
-                                       forwarder_length, depth, address);
+        status = ResolveForwarder(ctx,
+                                       (const char *)(base + functionRva),
+                                       forwarderLength, depth, address);
 
-        ctx->forward_depth = depth - 1u;
-        ctx->forward_visited_count -= 1u;
+        ctx->ForwardDepth = depth - 1u;
+        ctx->ForwardVisitedCount -= 1u;
         return status;
     }
 
-    *address = (void *)(base + function_rva);
-    return PIC_RESOLVE_OK;
+    *address = (PVOID)(base + functionRva);
+    return ResolveStatusOk;
 }
 
-PIC_CODE PIC_PEB *PIC_MS_ABI pic_current_peb(void)
+CODE_SECTION PPEB_PARTIAL MS_ABI CurrentPeb(void)
 {
-    PIC_PEB *peb;
+    PPEB_PARTIAL peb;
     __asm__ volatile ("movq %%gs:0x60, %0" : "=r" (peb));
     return peb;
 }
 
-PIC_CODE void PIC_MS_ABI pic_hash_ascii_upper(const pic_u8 *data,
-                                               pic_u32 length,
-                                               PIC_HASH *out)
+CODE_SECTION void MS_ABI HashAsciiUpper(const BYTE *data,
+                                               DWORD length,
+                                               API_HASH *out)
 {
-    pic_u32 fnv;
-    pic_u32 djb;
-    pic_u32 index;
+    DWORD fnv;
+    DWORD djb;
+    DWORD index;
 
-    if (out == PIC_NULL) {
+    if (out == NULL) {
         return;
     }
-    if (data == PIC_NULL || length > PIC_MAX_EXPORT_NAME_BYTES) {
-        out->fnv = 0u;
-        out->djb = 0u;
+    if (data == NULL || length > MAX_EXPORT_NAME_BYTES) {
+        out->Fnv = 0u;
+        out->Djb = 0u;
         return;
     }
 
-    fnv = PIC_HASH_SEED_FNV;
-    djb = PIC_HASH_SEED_DJB;
+    fnv = API_HASH_SEED_FNV;
+    djb = API_HASH_SEED_DJB;
     for (index = 0u; index < length; ++index) {
-        pic_u32 value = (pic_u32)pic_fold_u8(data[index]);
+        DWORD value = (DWORD)FoldU8(data[index]);
         fnv ^= value;
-        fnv *= PIC_HASH_PRIME;
+        fnv *= API_HASH_PRIME;
         djb = (djb << 5u) + djb + value;
     }
-    out->fnv = fnv;
-    out->djb = djb;
+    out->Fnv = fnv;
+    out->Djb = djb;
 }
 
 
-PIC_CODE void PIC_MS_ABI pic_hash_utf16_upper(const pic_u16 *data,
-                                               pic_u32 code_units,
-                                               PIC_HASH *out)
+CODE_SECTION void MS_ABI HashUtf16Upper(PCWSTR data,
+                                               DWORD codeUnits,
+                                               API_HASH *out)
 {
-    pic_u32 fnv;
-    pic_u32 djb;
-    pic_u32 index;
+    DWORD fnv;
+    DWORD djb;
+    DWORD index;
 
-    if (out == PIC_NULL) {
+    if (out == NULL) {
         return;
     }
-    if (data == PIC_NULL || code_units > PIC_MAX_MODULE_NAME_CHARS) {
-        out->fnv = 0u;
-        out->djb = 0u;
+    if (data == NULL || codeUnits > MAX_MODULE_NAME_CHARS) {
+        out->Fnv = 0u;
+        out->Djb = 0u;
         return;
     }
 
-    fnv = PIC_HASH_SEED_FNV;
-    djb = PIC_HASH_SEED_DJB;
-    for (index = 0u; index < code_units; ++index) {
-        pic_u16 value = pic_fold_u16(data[index]);
-        pic_u32 low;
-        pic_u32 high;
+    fnv = API_HASH_SEED_FNV;
+    djb = API_HASH_SEED_DJB;
+    for (index = 0u; index < codeUnits; ++index) {
+        WORD value = FoldU16(data[index]);
+        DWORD low;
+        DWORD high;
 
-        low = (pic_u32)(value & 0xFFu);
-        high = (pic_u32)((value >> 8u) & 0xFFu);
+        low = (DWORD)(value & 0xFFu);
+        high = (DWORD)((value >> 8u) & 0xFFu);
         fnv ^= low;
-        fnv *= PIC_HASH_PRIME;
+        fnv *= API_HASH_PRIME;
         djb = (djb << 5u) + djb + low;
         fnv ^= high;
-        fnv *= PIC_HASH_PRIME;
+        fnv *= API_HASH_PRIME;
         djb = (djb << 5u) + djb + high;
     }
-    out->fnv = fnv;
-    out->djb = djb;
+    out->Fnv = fnv;
+    out->Djb = djb;
 }
 
-/* Dual-32 over byte-read UTF-16 units; identical values to
- * pic_hash_utf16_upper for the same text, so schema host names hash the
- * same as Ldr BaseDllName contents. */
-static PIC_CODE void pic_hash_utf16_bytes_upper(const pic_u8 *bytes,
-                                                pic_u32 code_units,
-                                                PIC_HASH *out)
+/* Hash byte-read UTF-16 using the loader-name rules. */
+static CODE_SECTION void HashUtf16BytesUpper(const BYTE *bytes,
+                                                DWORD codeUnits,
+                                                API_HASH *out)
 {
-    pic_u32 fnv;
-    pic_u32 djb;
-    pic_u32 index;
+    DWORD fnv;
+    DWORD djb;
+    DWORD index;
 
-    if (out == PIC_NULL) {
+    if (out == NULL) {
         return;
     }
-    if (bytes == PIC_NULL || code_units > PIC_MAX_MODULE_NAME_CHARS) {
-        out->fnv = 0u;
-        out->djb = 0u;
+    if (bytes == NULL || codeUnits > MAX_MODULE_NAME_CHARS) {
+        out->Fnv = 0u;
+        out->Djb = 0u;
         return;
     }
 
-    fnv = PIC_HASH_SEED_FNV;
-    djb = PIC_HASH_SEED_DJB;
-    for (index = 0u; index < code_units; ++index) {
-        pic_u16 value = pic_fold_u16(pic_read_u16(bytes + index * 2u));
-        pic_u32 low;
-        pic_u32 high;
+    fnv = API_HASH_SEED_FNV;
+    djb = API_HASH_SEED_DJB;
+    for (index = 0u; index < codeUnits; ++index) {
+        WORD value = FoldU16(ReadU16(bytes + index * 2u));
+        DWORD low;
+        DWORD high;
 
-        low = (pic_u32)(value & 0xFFu);
-        high = (pic_u32)((value >> 8u) & 0xFFu);
+        low = (DWORD)(value & 0xFFu);
+        high = (DWORD)((value >> 8u) & 0xFFu);
         fnv ^= low;
-        fnv *= PIC_HASH_PRIME;
+        fnv *= API_HASH_PRIME;
         djb = (djb << 5u) + djb + low;
         fnv ^= high;
-        fnv *= PIC_HASH_PRIME;
+        fnv *= API_HASH_PRIME;
         djb = (djb << 5u) + djb + high;
     }
-    out->fnv = fnv;
-    out->djb = djb;
+    out->Fnv = fnv;
+    out->Djb = djb;
 }
 
-PIC_CODE PIC_RESOLVE_STATUS PIC_MS_ABI pic_find_module(PIC_CONTEXT *ctx,
-                                                        const PIC_HASH *module_hash,
-                                                        void **module_base)
+CODE_SECTION RESOLVE_STATUS MS_ABI FindModule(RESOLVER_CONTEXT *ctx,
+                                                        const API_HASH *moduleHash,
+                                                        PVOID*moduleBase)
 {
-    PIC_PEB *peb;
-    PIC_LIST_ENTRY *head;
-    PIC_LIST_ENTRY *link;
-    pic_u32 walked;
-    pic_u32 index;
+    PPEB_PARTIAL peb;
+    PLIST_ENTRY head;
+    PLIST_ENTRY link;
+    DWORD walked;
+    DWORD index;
 
-    if (ctx == PIC_NULL || module_base == PIC_NULL || module_hash == PIC_NULL ||
-        pic_hash_is_zero(module_hash) == PIC_TRUE) {
-        return PIC_RESOLVE_BAD_ARGUMENT;
+    if (ctx == NULL || moduleBase == NULL || moduleHash == NULL ||
+        HashIsZero(moduleHash) == TRUE) {
+        return ResolveStatusBadArgument;
     }
-    *module_base = PIC_NULL;
+    *moduleBase = NULL;
 
-    /* Cache hit: modules are assumed not to unload during one operation. */
-    for (index = 0u; index < PIC_MODULE_CACHE_CAPACITY; ++index) {
-        if (pic_hash_equal(&ctx->modules[index].name_hash, module_hash) == PIC_TRUE &&
-            ctx->modules[index].base != PIC_NULL) {
-            *module_base = ctx->modules[index].base;
-            return PIC_RESOLVE_OK;
+    /* Cache entries assume modules stay loaded for this operation. */
+    for (index = 0u; index < MODULE_CACHE_CAPACITY; ++index) {
+        if (HashEqual(&ctx->Modules[index].NameHash, moduleHash) == TRUE &&
+            ctx->Modules[index].Base != NULL) {
+            *moduleBase = ctx->Modules[index].Base;
+            return ResolveStatusOk;
         }
     }
 
-    peb = pic_current_peb();
-    if (peb == PIC_NULL) {
-        ctx->last_error = (pic_u32)PIC_RESOLVE_NO_PEB;
-        return PIC_RESOLVE_NO_PEB;
+    peb = CurrentPeb();
+    if (peb == NULL) {
+        ctx->LastError = (DWORD)ResolveStatusNoPeb;
+        return ResolveStatusNoPeb;
     }
-    if (peb->Ldr == PIC_NULL) {
-        ctx->last_error = (pic_u32)PIC_RESOLVE_NO_LDR;
-        return PIC_RESOLVE_NO_LDR;
+    if (peb->Ldr == NULL) {
+        ctx->LastError = (DWORD)ResolveStatusNoLdr;
+        return ResolveStatusNoLdr;
     }
 
     head = &peb->Ldr->InLoadOrderModuleList;
     link = head->Flink;
-    for (walked = 0u; link != PIC_NULL && link != head &&
-                       walked < PIC_MAX_MODULE_WALK; ++walked) {
-        PIC_LDR_DATA_TABLE_ENTRY *entry;
-        pic_u32 code_units;
-        PIC_HASH hash;
+    for (walked = 0u; link != NULL && link != head &&
+                       walked < MAX_MODULE_WALK; ++walked) {
+        PLDR_DATA_TABLE_ENTRY_PARTIAL entry;
+        DWORD codeUnits;
+        API_HASH hash;
 
-        entry = (PIC_LDR_DATA_TABLE_ENTRY *)link;
-        if (entry->BaseDllName.Buffer != PIC_NULL &&
+        entry = (PLDR_DATA_TABLE_ENTRY_PARTIAL)link;
+        if (entry->BaseDllName.Buffer != NULL &&
             entry->BaseDllName.Length <= entry->BaseDllName.MaximumLength &&
             (entry->BaseDllName.Length & 1u) == 0u) {
-            code_units = (pic_u32)entry->BaseDllName.Length / 2u;
-            if (code_units <= PIC_MAX_MODULE_NAME_CHARS) {
-                pic_hash_utf16_upper(entry->BaseDllName.Buffer, code_units, &hash);
-                if (pic_hash_equal(&hash, module_hash) == PIC_TRUE &&
-                    entry->DllBase != PIC_NULL &&
+            codeUnits = (DWORD)entry->BaseDllName.Length / 2u;
+            if (codeUnits <= MAX_MODULE_NAME_CHARS) {
+                HashUtf16Upper(entry->BaseDllName.Buffer, codeUnits, &hash);
+                if (HashEqual(&hash, moduleHash) == TRUE &&
+                    entry->DllBase != NULL &&
                     entry->SizeOfImage != 0u) {
-                    /* Cache fill: first free slot only, no eviction. */
-                    for (index = 0u; index < PIC_MODULE_CACHE_CAPACITY; ++index) {
-                        if (pic_hash_is_zero(&ctx->modules[index].name_hash) == PIC_TRUE) {
-                            ctx->modules[index].name_hash = *module_hash;
-                            ctx->modules[index].image_size = entry->SizeOfImage;
-                            ctx->modules[index].base = entry->DllBase;
+                    /* Fill the first free cache slot. */
+                    for (index = 0u; index < MODULE_CACHE_CAPACITY; ++index) {
+                        if (HashIsZero(&ctx->Modules[index].NameHash) == TRUE) {
+                            ctx->Modules[index].NameHash = *moduleHash;
+                            ctx->Modules[index].ImageSize = entry->SizeOfImage;
+                            ctx->Modules[index].Base = entry->DllBase;
                             break;
                         }
                     }
-                    *module_base = entry->DllBase;
-                    return PIC_RESOLVE_OK;
+                    *moduleBase = entry->DllBase;
+                    return ResolveStatusOk;
                 }
             }
         }
         link = link->Flink;
     }
 
-    if (walked >= PIC_MAX_MODULE_WALK) {
-        ctx->last_error = (pic_u32)PIC_RESOLVE_BOUND_EXCEEDED;
-        return PIC_RESOLVE_BOUND_EXCEEDED;
+    if (walked >= MAX_MODULE_WALK) {
+        ctx->LastError = (DWORD)ResolveStatusBoundExceeded;
+        return ResolveStatusBoundExceeded;
     }
-    ctx->last_error = (pic_u32)PIC_RESOLVE_MODULE_NOT_FOUND;
-    return PIC_RESOLVE_MODULE_NOT_FOUND;
+    ctx->LastError = (DWORD)ResolveStatusModuleNotFound;
+    return ResolveStatusModuleNotFound;
 }
 
-PIC_CODE PIC_RESOLVE_STATUS PIC_MS_ABI pic_resolve_export(PIC_CONTEXT *ctx,
-                                                           void *module_base,
-                                                           const PIC_HASH *export_hash,
-                                                           void **address)
+CODE_SECTION RESOLVE_STATUS MS_ABI ResolveExport(RESOLVER_CONTEXT *ctx,
+                                                           PVOID moduleBase,
+                                                           const API_HASH *exportHash,
+                                                           PVOID*address)
 {
-    const pic_u8 *base;
-    pic_u32 image_size;
-    pic_u32 dir_rva;
-    pic_u32 dir_size;
-    pic_u32 name_count;
-    pic_u32 function_count;
-    pic_u32 names_rva;
-    pic_u32 ordinals_rva;
-    pic_u32 functions_rva;
-    PIC_RESOLVE_STATUS status;
-    pic_u32 index;
+    const BYTE *base;
+    DWORD imageSize;
+    DWORD dirRva;
+    DWORD dirSize;
+    DWORD nameCount;
+    DWORD functionCount;
+    DWORD namesRva;
+    DWORD ordinalsRva;
+    DWORD functionsRva;
+    RESOLVE_STATUS status;
+    DWORD index;
 
-    if (ctx == PIC_NULL || module_base == PIC_NULL || address == PIC_NULL ||
-        export_hash == PIC_NULL ||
-        pic_hash_is_zero(export_hash) == PIC_TRUE) {
-        return PIC_RESOLVE_BAD_ARGUMENT;
+    if (ctx == NULL || moduleBase == NULL || address == NULL ||
+        exportHash == NULL ||
+        HashIsZero(exportHash) == TRUE) {
+        return ResolveStatusBadArgument;
     }
-    *address = PIC_NULL;
+    *address = NULL;
 
-    status = pic_validate_image(module_base, &image_size, &dir_rva, &dir_size);
-    if (status != PIC_RESOLVE_OK) {
-        return pic_fail(ctx, status);
-    }
-
-    base = (const pic_u8 *)module_base;
-    name_count = pic_read_u32(base + dir_rva + PIC_EXP_OFF(NumberOfNames));
-    function_count = pic_read_u32(base + dir_rva + PIC_EXP_OFF(NumberOfFunctions));
-    names_rva = pic_read_u32(base + dir_rva + PIC_EXP_OFF(AddressOfNames));
-    ordinals_rva = pic_read_u32(base + dir_rva + PIC_EXP_OFF(AddressOfNameOrdinals));
-    functions_rva = pic_read_u32(base + dir_rva + PIC_EXP_OFF(AddressOfFunctions));
-
-    if (name_count > PIC_MAX_EXPORT_NAMES || function_count > PIC_MAX_EXPORT_NAMES) {
-        return pic_fail(ctx, PIC_RESOLVE_BOUND_EXCEEDED);
-    }
-    if (name_count == 0u || functions_rva == 0u) {
-        return pic_fail(ctx, PIC_RESOLVE_EXPORT_NOT_FOUND);
-    }
-    if (!pic_range_within(names_rva, name_count * 4u, image_size) ||
-        !pic_range_within(ordinals_rva, name_count * 2u, image_size) ||
-        !pic_range_within(functions_rva, function_count * 4u, image_size)) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+    status = ValidateImage(moduleBase, &imageSize, &dirRva, &dirSize);
+    if (status != ResolveStatusOk) {
+        return Fail(ctx, status);
     }
 
-    /* Hashed lookup cannot binary-search (names are sorted lexically, not
-     * by hash): a bounded linear scan is the deterministic option. */
-    for (index = 0u; index < name_count; ++index) {
-        pic_u32 name_rva = pic_read_u32(base + names_rva + index * 4u);
-        pic_u32 name_length = pic_scan_ascii_name(base, image_size, name_rva);
-        PIC_HASH name_hash;
+    base = (const BYTE *)moduleBase;
+    nameCount = ReadU32(base + dirRva + EXP_OFF(NumberOfNames));
+    functionCount = ReadU32(base + dirRva + EXP_OFF(NumberOfFunctions));
+    namesRva = ReadU32(base + dirRva + EXP_OFF(AddressOfNames));
+    ordinalsRva = ReadU32(base + dirRva + EXP_OFF(AddressOfNameOrdinals));
+    functionsRva = ReadU32(base + dirRva + EXP_OFF(AddressOfFunctions));
 
-        if (name_length == PIC_NAME_INVALID) {
+    if (nameCount > MAX_EXPORT_NAMES || functionCount > MAX_EXPORT_NAMES) {
+        return Fail(ctx, ResolveStatusBoundExceeded);
+    }
+    if (nameCount == 0u || functionsRva == 0u) {
+        return Fail(ctx, ResolveStatusExportNotFound);
+    }
+    if (!RangeWithin(namesRva, nameCount * 4u, imageSize) ||
+        !RangeWithin(ordinalsRva, nameCount * 2u, imageSize) ||
+        !RangeWithin(functionsRva, functionCount * 4u, imageSize)) {
+        return Fail(ctx, ResolveStatusBadImage);
+    }
+
+    /* Hash lookup requires a bounded linear scan. */
+    for (index = 0u; index < nameCount; ++index) {
+        DWORD nameRva = ReadU32(base + namesRva + index * 4u);
+        DWORD nameLength = ScanAsciiName(base, imageSize, nameRva);
+        API_HASH nameHash;
+
+        if (nameLength == NAME_INVALID) {
             continue;
         }
-        pic_hash_ascii_upper(base + name_rva, name_length, &name_hash);
-        if (pic_hash_equal(&name_hash, export_hash) == PIC_TRUE) {
-            pic_u32 hint = (pic_u32)pic_read_u16(base + ordinals_rva + index * 2u);
-            pic_u32 function_rva;
+        HashAsciiUpper(base + nameRva, nameLength, &nameHash);
+        if (HashEqual(&nameHash, exportHash) == TRUE) {
+            DWORD hint = (DWORD)ReadU16(base + ordinalsRva + index * 2u);
+            DWORD functionRva;
 
-            if (hint >= function_count) {
-                return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+            if (hint >= functionCount) {
+                return Fail(ctx, ResolveStatusBadImage);
             }
-            function_rva = pic_read_u32(base + functions_rva + hint * 4u);
-            return pic_export_finish(ctx, base, image_size, dir_rva, dir_size,
-                                     function_rva, address);
+            functionRva = ReadU32(base + functionsRva + hint * 4u);
+            return ExportFinish(ctx, base, imageSize, dirRva, dirSize,
+                                     functionRva, address);
         }
     }
-    return pic_fail(ctx, PIC_RESOLVE_EXPORT_NOT_FOUND);
+    return Fail(ctx, ResolveStatusExportNotFound);
 }
 
-PIC_CODE PIC_RESOLVE_STATUS PIC_MS_ABI pic_resolve_ordinal(PIC_CONTEXT *ctx,
-                                                            void *module_base,
-                                                            pic_u16 ordinal,
-                                                            void **address)
+CODE_SECTION RESOLVE_STATUS MS_ABI ResolveOrdinal(RESOLVER_CONTEXT *ctx,
+                                                            PVOID moduleBase,
+                                                            WORD ordinal,
+                                                            PVOID*address)
 {
-    const pic_u8 *base;
-    pic_u32 image_size;
-    pic_u32 dir_rva;
-    pic_u32 dir_size;
-    pic_u32 function_count;
-    pic_u32 functions_rva;
-    pic_u32 ordinal_base;
-    pic_u32 ordinal_value;
-    pic_u32 index;
-    pic_u32 function_rva;
-    PIC_RESOLVE_STATUS status;
+    const BYTE *base;
+    DWORD imageSize;
+    DWORD dirRva;
+    DWORD dirSize;
+    DWORD functionCount;
+    DWORD functionsRva;
+    DWORD ordinalBase;
+    DWORD ordinalValue;
+    DWORD index;
+    DWORD functionRva;
+    RESOLVE_STATUS status;
 
-    if (ctx == PIC_NULL || module_base == PIC_NULL || address == PIC_NULL) {
-        return PIC_RESOLVE_BAD_ARGUMENT;
+    if (ctx == NULL || moduleBase == NULL || address == NULL) {
+        return ResolveStatusBadArgument;
     }
-    *address = PIC_NULL;
+    *address = NULL;
 
-    status = pic_validate_image(module_base, &image_size, &dir_rva, &dir_size);
-    if (status != PIC_RESOLVE_OK) {
-        return pic_fail(ctx, status);
-    }
-
-    base = (const pic_u8 *)module_base;
-    function_count = pic_read_u32(base + dir_rva + PIC_EXP_OFF(NumberOfFunctions));
-    functions_rva = pic_read_u32(base + dir_rva + PIC_EXP_OFF(AddressOfFunctions));
-    ordinal_base = pic_read_u32(base + dir_rva + PIC_EXP_OFF(Base));
-
-    /* A genuine ordinal: subtract the export ordinal base; the remainder is
-     * the address-table index, not an ordinal itself. */
-    ordinal_value = (pic_u32)ordinal;
-    if (ordinal_value < ordinal_base || function_count == 0u ||
-        functions_rva == 0u || function_count > PIC_MAX_EXPORT_NAMES ||
-        !pic_range_within(functions_rva, function_count * 4u, image_size)) {
-        return pic_fail(ctx, PIC_RESOLVE_ORDINAL_OUT_OF_RANGE);
-    }
-    index = ordinal_value - ordinal_base;
-    if (index >= function_count) {
-        return pic_fail(ctx, PIC_RESOLVE_ORDINAL_OUT_OF_RANGE);
+    status = ValidateImage(moduleBase, &imageSize, &dirRva, &dirSize);
+    if (status != ResolveStatusOk) {
+        return Fail(ctx, status);
     }
 
-    function_rva = pic_read_u32(base + functions_rva + index * 4u);
-    return pic_export_finish(ctx, base, image_size, dir_rva, dir_size,
-                             function_rva, address);
+    base = (const BYTE *)moduleBase;
+    functionCount = ReadU32(base + dirRva + EXP_OFF(NumberOfFunctions));
+    functionsRva = ReadU32(base + dirRva + EXP_OFF(AddressOfFunctions));
+    ordinalBase = ReadU32(base + dirRva + EXP_OFF(Base));
+
+    /* Convert the true ordinal to an address-table index. */
+    ordinalValue = (DWORD)ordinal;
+    if (ordinalValue < ordinalBase || functionCount == 0u ||
+        functionsRva == 0u || functionCount > MAX_EXPORT_NAMES ||
+        !RangeWithin(functionsRva, functionCount * 4u, imageSize)) {
+        return Fail(ctx, ResolveStatusOrdinalOutOfRange);
+    }
+    index = ordinalValue - ordinalBase;
+    if (index >= functionCount) {
+        return Fail(ctx, ResolveStatusOrdinalOutOfRange);
+    }
+
+    functionRva = ReadU32(base + functionsRva + index * 4u);
+    return ExportFinish(ctx, base, imageSize, dirRva, dirSize,
+                             functionRva, address);
 }
 
-/* "api-" / "ext-" prefix test on the module part of a forwarder. */
-static PIC_CODE pic_bool pic_ascii_is_apiset_prefix(const char *name, pic_u32 length)
+/* Test for an api- or ext- prefix. */
+static CODE_SECTION BOOL AsciiIsApiSetPrefix(const char *name, DWORD length)
 {
-    pic_u8 c0;
-    pic_u8 c1;
-    pic_u8 c2;
-    pic_u8 c3;
+    BYTE c0;
+    BYTE c1;
+    BYTE c2;
+    BYTE c3;
 
     if (length < 4u) {
-        return PIC_FALSE;
+        return FALSE;
     }
-    c0 = pic_fold_u8((pic_u8)name[0]);
-    c1 = pic_fold_u8((pic_u8)name[1]);
-    c2 = pic_fold_u8((pic_u8)name[2]);
-    c3 = pic_fold_u8((pic_u8)name[3]);
-    if (c0 == (pic_u8)'A' && c1 == (pic_u8)'P' && c2 == (pic_u8)'I' &&
-        c3 == (pic_u8)'-') {
-        return PIC_TRUE;
+    c0 = FoldU8((BYTE)name[0]);
+    c1 = FoldU8((BYTE)name[1]);
+    c2 = FoldU8((BYTE)name[2]);
+    c3 = FoldU8((BYTE)name[3]);
+    if (c0 == (BYTE)'A' && c1 == (BYTE)'P' && c2 == (BYTE)'I' &&
+        c3 == (BYTE)'-') {
+        return TRUE;
     }
-    if (c0 == (pic_u8)'E' && c1 == (pic_u8)'X' && c2 == (pic_u8)'T' &&
-        c3 == (pic_u8)'-') {
-        return PIC_TRUE;
+    if (c0 == (BYTE)'E' && c1 == (BYTE)'X' && c2 == (BYTE)'T' &&
+        c3 == (BYTE)'-') {
+        return TRUE;
     }
-    return PIC_FALSE;
+    return FALSE;
 }
 
-/* Widen an ASCII forwarder module name on the stack and resolve it through
- * the API-set schema.  Bounded by PIC_MAX_APISET_CONTRACT_CHARS. */
-static PIC_CODE PIC_RESOLVE_STATUS pic_forwarder_apiset_module(PIC_CONTEXT *ctx,
+/* Resolve a bounded ASCII API-set name through a stack UTF-16 copy. */
+static CODE_SECTION RESOLVE_STATUS ForwarderApiSetModule(RESOLVER_CONTEXT *ctx,
                                                        const char *module,
-                                                       pic_u32 module_length,
-                                                       void **module_base)
+                                                       DWORD moduleLength,
+                                                       PVOID*moduleBase)
 {
-    pic_u16 wide[PIC_MAX_APISET_CONTRACT_CHARS];
-    pic_u32 index;
+    WORD wide[MAX_APISET_CONTRACT_CHARS];
+    DWORD index;
 
-    if (module_length > PIC_MAX_APISET_CONTRACT_CHARS) {
-        return pic_fail(ctx, PIC_RESOLVE_BOUND_EXCEEDED);
+    if (moduleLength > MAX_APISET_CONTRACT_CHARS) {
+        return Fail(ctx, ResolveStatusBoundExceeded);
     }
-    for (index = 0u; index < module_length; ++index) {
-        wide[index] = (pic_u16)(pic_u8)module[index];
+    for (index = 0u; index < moduleLength; ++index) {
+        wide[index] = (WORD)(BYTE)module[index];
     }
-    return pic_resolve_apiset_contract(ctx, wide, module_length, module_base);
+    return ResolveApiSetContract(ctx, wide, moduleLength, moduleBase);
 }
 
-PIC_CODE PIC_RESOLVE_STATUS PIC_MS_ABI pic_resolve_forwarder(
-    PIC_CONTEXT *ctx,
+CODE_SECTION RESOLVE_STATUS MS_ABI ResolveForwarder(
+    RESOLVER_CONTEXT *ctx,
     const char *forwarder,
-    pic_u32 forwarder_length,
-    pic_u32 depth,
-    void **address)
+    DWORD forwarderLength,
+    DWORD depth,
+    PVOID*address)
 {
-    pic_u32 dot;
-    pic_u32 module_len;
-    pic_u32 entry_off;
-    pic_u32 entry_len;
-    pic_u32 index;
-    void *module_base;
-    PIC_RESOLVE_STATUS status;
+    DWORD dot;
+    DWORD moduleLen;
+    DWORD entryOff;
+    DWORD entryLen;
+    DWORD index;
+    PVOID moduleBase;
+    RESOLVE_STATUS status;
 
-    if (ctx == PIC_NULL || forwarder == PIC_NULL || address == PIC_NULL ||
-        forwarder_length == 0u ||
-        forwarder_length > PIC_MAX_EXPORT_NAME_BYTES) {
-        return PIC_RESOLVE_BAD_ARGUMENT;
+    if (ctx == NULL || forwarder == NULL || address == NULL ||
+        forwarderLength == 0u ||
+        forwarderLength > MAX_EXPORT_NAME_BYTES) {
+        return ResolveStatusBadArgument;
     }
-    *address = PIC_NULL;
-    if (depth == 0u || depth > PIC_MAX_FORWARD_DEPTH) {
-        return pic_fail(ctx, PIC_RESOLVE_FORWARD_DEPTH);
+    *address = NULL;
+    if (depth == 0u || depth > MAX_FORWARD_DEPTH) {
+        return Fail(ctx, ResolveStatusForwardDepth);
     }
 
-    /* Split at the LAST dot: module names may themselves contain dots
-     * (api-set contracts), while entry names cannot. */
-    dot = forwarder_length;
-    for (index = 0u; index < forwarder_length; ++index) {
+    /* Split at the last dot because API-set module names contain dots. */
+    dot = forwarderLength;
+    for (index = 0u; index < forwarderLength; ++index) {
         if (forwarder[index] == '.') {
             dot = index;
         }
     }
-    if (dot == forwarder_length) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+    if (dot == forwarderLength) {
+        return Fail(ctx, ResolveStatusBadImage);
     }
-    module_len = dot;
-    entry_off = dot + 1u;
-    entry_len = forwarder_length - entry_off;
-    if (module_len == 0u || entry_len == 0u) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+    moduleLen = dot;
+    entryOff = dot + 1u;
+    entryLen = forwarderLength - entryOff;
+    if (moduleLen == 0u || entryLen == 0u) {
+        return Fail(ctx, ResolveStatusBadImage);
     }
 
-    if (pic_ascii_is_apiset_prefix(forwarder, module_len) == PIC_TRUE) {
-        status = pic_forwarder_apiset_module(ctx, forwarder, module_len,
-                                             &module_base);
+    if (AsciiIsApiSetPrefix(forwarder, moduleLen) == TRUE) {
+        status = ForwarderApiSetModule(ctx, forwarder, moduleLen,
+                                             &moduleBase);
     } else {
         {
-            PIC_HASH module_hash;
-            pic_hash_ascii_upper((const pic_u8 *)forwarder, module_len,
-                                 &module_hash);
-            status = pic_find_module(ctx, &module_hash, &module_base);
+            API_HASH moduleHash;
+            HashAsciiUpper((const BYTE *)forwarder, moduleLen,
+                                 &moduleHash);
+            status = FindModule(ctx, &moduleHash, &moduleBase);
         }
     }
-    if (status != PIC_RESOLVE_OK) {
+    if (status != ResolveStatusOk) {
         return status;
     }
 
-    if (forwarder[entry_off] == '#') {
-        pic_u32 ordinal_value = 0u;
+    if (forwarder[entryOff] == '#') {
+        DWORD ordinalValue = 0u;
 
-        if (entry_len == 1u) {
-            return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+        if (entryLen == 1u) {
+            return Fail(ctx, ResolveStatusBadImage);
         }
-        for (index = entry_off + 1u; index < forwarder_length; ++index) {
-            pic_u8 digit_char = (pic_u8)forwarder[index];
-            pic_u32 digit;
+        for (index = entryOff + 1u; index < forwarderLength; ++index) {
+            BYTE digitChar = (BYTE)forwarder[index];
+            DWORD digit;
 
-            if (digit_char < (pic_u8)'0' || digit_char > (pic_u8)'9') {
-                return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+            if (digitChar < (BYTE)'0' || digitChar > (BYTE)'9') {
+                return Fail(ctx, ResolveStatusBadImage);
             }
-            digit = (pic_u32)(digit_char - (pic_u8)'0');
-            if (ordinal_value > (0xFFFFu - digit) / 10u) {
-                return pic_fail(ctx, PIC_RESOLVE_ORDINAL_OUT_OF_RANGE);
+            digit = (DWORD)(digitChar - (BYTE)'0');
+            if (ordinalValue > (0xFFFFu - digit) / 10u) {
+                return Fail(ctx, ResolveStatusOrdinalOutOfRange);
             }
-            ordinal_value = ordinal_value * 10u + digit;
+            ordinalValue = ordinalValue * 10u + digit;
         }
-        return pic_resolve_ordinal(ctx, module_base,
-                                   (pic_u16)ordinal_value, address);
+        return ResolveOrdinal(ctx, moduleBase,
+                                   (WORD)ordinalValue, address);
     }
     {
-        PIC_HASH entry_hash;
-        pic_hash_ascii_upper((const pic_u8 *)forwarder + entry_off, entry_len,
-                             &entry_hash);
-        return pic_resolve_export(ctx, module_base, &entry_hash, address);
+        API_HASH entryHash;
+        HashAsciiUpper((const BYTE *)forwarder + entryOff, entryLen,
+                             &entryHash);
+        return ResolveExport(ctx, moduleBase, &entryHash, address);
     }
 }
 
-/* Case-insensitive compare of contract[0..units) against byte-read schema
- * name bytes. */
-static PIC_CODE pic_bool pic_apiset_name_equal(const pic_u16 *contract,
-                                       pic_u32 units,
-                                       const pic_u8 *stored)
+/* Compare a contract with a byte-read schema name. */
+static CODE_SECTION BOOL ApiSetNameEqual(PCWSTR contract,
+                                       DWORD units,
+                                       const BYTE *stored)
 {
-    pic_u32 index;
+    DWORD index;
 
     for (index = 0u; index < units; ++index) {
-        if (pic_fold_u16(contract[index]) !=
-            pic_fold_u16(pic_read_u16(stored + index * 2u))) {
-            return PIC_FALSE;
+        if (FoldU16(contract[index]) !=
+            FoldU16(ReadU16(stored + index * 2u))) {
+            return FALSE;
         }
     }
-    return PIC_TRUE;
+    return TRUE;
 }
 
-PIC_CODE PIC_RESOLVE_STATUS PIC_MS_ABI pic_resolve_apiset_contract(
-    PIC_CONTEXT *ctx,
-    const pic_u16 *contract,
-    pic_u32 contract_code_units,
-    void **module_base)
+CODE_SECTION RESOLVE_STATUS MS_ABI ResolveApiSetContract(
+    RESOLVER_CONTEXT *ctx,
+    PCWSTR contract,
+    DWORD contractCodeUnits,
+    PVOID*moduleBase)
 {
-    PIC_PEB *peb;
-    const pic_u8 *schema;
-    pic_u32 schema_size;
-    pic_u32 entry_count;
-    pic_u32 entry_offset;
-    pic_u32 hashed_units;
-    pic_u32 cut;
-    pic_bool have_cut;
-    pic_u32 index;
-    pic_u16 p0;
-    pic_u16 p1;
-    pic_u16 p2;
-    pic_u16 p3;
+    PPEB_PARTIAL peb;
+    const BYTE *schema;
+    DWORD schemaSize;
+    DWORD entryCount;
+    DWORD entryOffset;
+    DWORD hashedUnits;
+    DWORD cut;
+    BOOL haveCut;
+    DWORD index;
+    WORD p0;
+    WORD p1;
+    WORD p2;
+    WORD p3;
 
-    if (ctx == PIC_NULL || contract == PIC_NULL || module_base == PIC_NULL ||
-        contract_code_units == 0u ||
-        contract_code_units > PIC_MAX_APISET_CONTRACT_CHARS) {
-        return PIC_RESOLVE_BAD_ARGUMENT;
+    if (ctx == NULL || contract == NULL || moduleBase == NULL ||
+        contractCodeUnits == 0u ||
+        contractCodeUnits > MAX_APISET_CONTRACT_CHARS) {
+        return ResolveStatusBadArgument;
     }
-    *module_base = PIC_NULL;
+    *moduleBase = NULL;
 
-    /* Loader rule: contract names start with api- or ext- (any case).  A
-     * trailing ".dll" is accepted and ignored by the truncation below. */
-    if (contract_code_units < 4u) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_ARGUMENT);
+    /* Accept api-/ext- contracts with an optional .dll suffix. */
+    if (contractCodeUnits < 4u) {
+        return Fail(ctx, ResolveStatusBadArgument);
     }
-    p0 = pic_fold_u16(contract[0]);
-    p1 = pic_fold_u16(contract[1]);
-    p2 = pic_fold_u16(contract[2]);
-    p3 = pic_fold_u16(contract[3]);
-    if (!((p0 == (pic_u16)'A' && p1 == (pic_u16)'P' && p2 == (pic_u16)'I' &&
-           p3 == (pic_u16)'-') ||
-          (p0 == (pic_u16)'E' && p1 == (pic_u16)'X' && p2 == (pic_u16)'T' &&
-           p3 == (pic_u16)'-'))) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_ARGUMENT);
+    p0 = FoldU16(contract[0]);
+    p1 = FoldU16(contract[1]);
+    p2 = FoldU16(contract[2]);
+    p3 = FoldU16(contract[3]);
+    if (!((p0 == (WORD)'A' && p1 == (WORD)'P' && p2 == (WORD)'I' &&
+           p3 == (WORD)'-') ||
+          (p0 == (WORD)'E' && p1 == (WORD)'X' && p2 == (WORD)'T' &&
+           p3 == (WORD)'-'))) {
+        return Fail(ctx, ResolveStatusBadArgument);
     }
 
-    /* Loader rule: matching uses the name truncated at the last hyphen. */
-    have_cut = PIC_FALSE;
-    for (index = contract_code_units; index > 0u; --index) {
-        if (contract[index - 1u] == (pic_u16)'-') {
+    /* Match the contract prefix through its last hyphen. */
+    haveCut = FALSE;
+    for (index = contractCodeUnits; index > 0u; --index) {
+        if (contract[index - 1u] == (WORD)'-') {
             cut = index - 1u;
-            have_cut = PIC_TRUE;
+            haveCut = TRUE;
             break;
         }
     }
-    if (have_cut != PIC_TRUE || cut == 0u) {
-        return pic_fail(ctx, PIC_RESOLVE_BAD_ARGUMENT);
+    if (haveCut != TRUE || cut == 0u) {
+        return Fail(ctx, ResolveStatusBadArgument);
     }
-    hashed_units = cut;
+    hashedUnits = cut;
 
-    peb = pic_current_peb();
-    if (peb == PIC_NULL) {
-        ctx->last_error = (pic_u32)PIC_RESOLVE_NO_PEB;
-        return PIC_RESOLVE_NO_PEB;
+    peb = CurrentPeb();
+    if (peb == NULL) {
+        ctx->LastError = (DWORD)ResolveStatusNoPeb;
+        return ResolveStatusNoPeb;
     }
-    if (peb->ApiSetMap == PIC_NULL) {
-        return pic_fail(ctx, PIC_RESOLVE_APISET_UNSUPPORTED);
+    if (peb->ApiSetMap == NULL) {
+        return Fail(ctx, ResolveStatusApiSetUnsupported);
     }
-    schema = (const pic_u8 *)peb->ApiSetMap;
+    schema = (const BYTE *)peb->ApiSetMap;
 
-    if (pic_read_u32(schema + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE, version)) !=
-        PIC_APISET_SCHEMA_VERSION_6) {
-        return pic_fail(ctx, PIC_RESOLVE_APISET_UNSUPPORTED);
+    if (ReadU32(schema + (DWORD)offsetof(APISET_NAMESPACE_V6, Version)) !=
+        APISET_SCHEMA_VERSION_6) {
+        return Fail(ctx, ResolveStatusApiSetUnsupported);
     }
-    schema_size = pic_read_u32(
-        schema + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE, size));
-    entry_count = pic_read_u32(
-        schema + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE, count));
-    entry_offset = pic_read_u32(
-        schema + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE, entry_offset));
-    if (schema_size == 0u || entry_count == 0u ||
-        entry_count > PIC_MAX_APISET_ENTRIES) {
-        return pic_fail(ctx, PIC_RESOLVE_APISET_UNSUPPORTED);
+    schemaSize = ReadU32(
+        schema + (DWORD)offsetof(APISET_NAMESPACE_V6, Size));
+    entryCount = ReadU32(
+        schema + (DWORD)offsetof(APISET_NAMESPACE_V6, Count));
+    entryOffset = ReadU32(
+        schema + (DWORD)offsetof(APISET_NAMESPACE_V6, EntryOffset));
+    if (schemaSize == 0u || entryCount == 0u ||
+        entryCount > MAX_APISET_ENTRIES) {
+        return Fail(ctx, ResolveStatusApiSetUnsupported);
     }
-    if (!pic_range_within(entry_offset,
-                          entry_count *
-                              (pic_u32)sizeof(PIC_APISET_NAMESPACE_ENTRY),
-                          schema_size)) {
-        return pic_fail(ctx, PIC_RESOLVE_APISET_UNSUPPORTED);
+    if (!RangeWithin(entryOffset,
+                          entryCount *
+                              (DWORD)sizeof(APISET_NAMESPACE_ENTRY_V6),
+                          schemaSize)) {
+        return Fail(ctx, ResolveStatusApiSetUnsupported);
     }
 
-    for (index = 0u; index < entry_count; ++index) {
-        const pic_u8 *entry = schema + entry_offset +
+    for (index = 0u; index < entryCount; ++index) {
+        const BYTE *entry = schema + entryOffset +
                               index *
-                                  (pic_u32)sizeof(PIC_APISET_NAMESPACE_ENTRY);
-        pic_u32 name_offset = pic_read_u32(
-            entry + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE_ENTRY, name_offset));
-        pic_u32 hashed_length = pic_read_u32(
-            entry + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE_ENTRY, hashed_length));
-        pic_u32 value_offset = pic_read_u32(
-            entry + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE_ENTRY, value_offset));
-        pic_u32 value_count = pic_read_u32(
-            entry + (pic_u32)PIC_OFFSETOF(PIC_APISET_NAMESPACE_ENTRY, value_count));
-        const pic_u8 *value;
-        pic_u32 host_offset;
-        pic_u32 host_length;
-        pic_u32 host_units;
-        PIC_HASH host_hash;
+                                  (DWORD)sizeof(APISET_NAMESPACE_ENTRY_V6);
+        DWORD nameOffset = ReadU32(
+            entry + (DWORD)offsetof(APISET_NAMESPACE_ENTRY_V6, NameOffset));
+        DWORD hashedLength = ReadU32(
+            entry + (DWORD)offsetof(APISET_NAMESPACE_ENTRY_V6, HashedLength));
+        DWORD valueOffset = ReadU32(
+            entry + (DWORD)offsetof(APISET_NAMESPACE_ENTRY_V6, ValueOffset));
+        DWORD valueCount = ReadU32(
+            entry + (DWORD)offsetof(APISET_NAMESPACE_ENTRY_V6, ValueCount));
+        const BYTE *value;
+        DWORD hostOffset;
+        DWORD hostLength;
+        DWORD hostUnits;
+        API_HASH hostHash;
 
-        if (hashed_length == 0u || (hashed_length & 1u) != 0u ||
-            hashed_length / 2u != hashed_units ||
-            !pic_range_within(name_offset, hashed_length, schema_size)) {
+        if (hashedLength == 0u || (hashedLength & 1u) != 0u ||
+            hashedLength / 2u != hashedUnits ||
+            !RangeWithin(nameOffset, hashedLength, schemaSize)) {
             continue;
         }
-        if (pic_apiset_name_equal(contract, hashed_units,
-                                  schema + name_offset) != PIC_TRUE) {
+        if (ApiSetNameEqual(contract, hashedUnits,
+                                  schema + nameOffset) != TRUE) {
             continue;
         }
 
-        /* Match: default (first) value entry is the host. */
-        if (value_count == 0u || value_count > PIC_MAX_APISET_VALUES ||
-            !pic_range_within(value_offset,
-                              value_count *
-                                  (pic_u32)sizeof(PIC_APISET_VALUE_ENTRY),
-                              schema_size)) {
-            return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+        /* The first value entry is the default host. */
+        if (valueCount == 0u || valueCount > MAX_APISET_VALUES ||
+            !RangeWithin(valueOffset,
+                              valueCount *
+                                  (DWORD)sizeof(APISET_VALUE_ENTRY_V6),
+                              schemaSize)) {
+            return Fail(ctx, ResolveStatusBadImage);
         }
-        value = schema + value_offset;
-        host_offset = pic_read_u32(
-            value + (pic_u32)PIC_OFFSETOF(PIC_APISET_VALUE_ENTRY, value_offset));
-        host_length = pic_read_u32(
-            value + (pic_u32)PIC_OFFSETOF(PIC_APISET_VALUE_ENTRY, value_length));
-        if (host_length == 0u || (host_length & 1u) != 0u ||
-            !pic_range_within(host_offset, host_length, schema_size)) {
-            return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+        value = schema + valueOffset;
+        hostOffset = ReadU32(
+            value + (DWORD)offsetof(APISET_VALUE_ENTRY_V6, ValueOffset));
+        hostLength = ReadU32(
+            value + (DWORD)offsetof(APISET_VALUE_ENTRY_V6, ValueLength));
+        if (hostLength == 0u || (hostLength & 1u) != 0u ||
+            !RangeWithin(hostOffset, hostLength, schemaSize)) {
+            return Fail(ctx, ResolveStatusBadImage);
         }
-        host_units = host_length / 2u;
-        if (host_units > PIC_MAX_MODULE_NAME_CHARS) {
-            return pic_fail(ctx, PIC_RESOLVE_BOUND_EXCEEDED);
+        hostUnits = hostLength / 2u;
+        if (hostUnits > MAX_MODULE_NAME_CHARS) {
+            return Fail(ctx, ResolveStatusBoundExceeded);
         }
 
-        /* Schema values include the ".dll" suffix; strip it so the hash
-         * matches Ldr BaseDllName contents. */
-        if (host_units >= 5u) {
-            const pic_u8 *suffix = schema + host_offset + (host_units - 4u) * 2u;
-            if (pic_fold_u16(pic_read_u16(suffix)) == (pic_u16)'.' &&
-                pic_fold_u16(pic_read_u16(suffix + 2u)) == (pic_u16)'D' &&
-                pic_fold_u16(pic_read_u16(suffix + 4u)) == (pic_u16)'L' &&
-                pic_fold_u16(pic_read_u16(suffix + 6u)) == (pic_u16)'L') {
-                host_units -= 4u;
+        /* Strip .dll before hashing against loader names. */
+        if (hostUnits >= 5u) {
+            const BYTE *suffix = schema + hostOffset + (hostUnits - 4u) * 2u;
+            if (FoldU16(ReadU16(suffix)) == (WORD)'.' &&
+                FoldU16(ReadU16(suffix + 2u)) == (WORD)'D' &&
+                FoldU16(ReadU16(suffix + 4u)) == (WORD)'L' &&
+                FoldU16(ReadU16(suffix + 6u)) == (WORD)'L') {
+                hostUnits -= 4u;
             }
         }
-        if (host_units == 0u) {
-            return pic_fail(ctx, PIC_RESOLVE_BAD_IMAGE);
+        if (hostUnits == 0u) {
+            return Fail(ctx, ResolveStatusBadImage);
         }
 
-        pic_hash_utf16_bytes_upper(schema + host_offset, host_units, &host_hash);
-        if (pic_hash_is_zero(&host_hash) == PIC_TRUE) {
-            return pic_fail(ctx, PIC_RESOLVE_BOUND_EXCEEDED);
+        HashUtf16BytesUpper(schema + hostOffset, hostUnits, &hostHash);
+        if (HashIsZero(&hostHash) == TRUE) {
+            return Fail(ctx, ResolveStatusBoundExceeded);
         }
-        return pic_find_module(ctx, &host_hash, module_base);
+        return FindModule(ctx, &hostHash, moduleBase);
     }
 
-    return pic_fail(ctx, PIC_RESOLVE_MODULE_NOT_FOUND);
+    return Fail(ctx, ResolveStatusModuleNotFound);
 }

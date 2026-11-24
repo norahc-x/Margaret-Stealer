@@ -1,106 +1,106 @@
-#define PIC_CODE_SECTION_NAME ".text$B"
+#define CODE_SECTION_NAME ".text$B"
 #include "margaret.h"
 #include "chromium_adapter.h"
 
-static PIC_CODE pic_u32 write_ping_result(MARGARET_ARGS *args,
-                                           pic_u32 blob_size)
+static CODE_SECTION DWORD WritePingResult(MARGARET_ARGS *args,
+                                           DWORD blobSize)
 {
     MARGARET_PING_RESULT *result;
 
-    if (args->output_buffer == PIC_NULL ||
-        args->output_capacity < (pic_u32)sizeof(MARGARET_PING_RESULT)) {
-        args->output_length = (pic_u32)sizeof(MARGARET_PING_RESULT);
-        args->status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
-        return (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
+    if (args->OutputBuffer == NULL ||
+        args->OutputCapacity < (DWORD)sizeof(MARGARET_PING_RESULT)) {
+        args->OutputLength = (DWORD)sizeof(MARGARET_PING_RESULT);
+        args->Status = (DWORD)MargaretStatusBufferTooSmall;
+        return (DWORD)MargaretStatusBufferTooSmall;
     }
 
-    result = (MARGARET_PING_RESULT *)args->output_buffer;
-    result->header.magic = MARGARET_RESULT_MAGIC;
-    result->header.version = MARGARET_ABI_VERSION;
-    result->header.status = (pic_u32)MARGARET_STATUS_OK;
-    result->header.payload_length =
-        (pic_u32)(sizeof(MARGARET_PING_RESULT) - sizeof(MARGARET_RESULT_HEADER));
-    result->architecture = MARGARET_ARCH_X64;
-    result->blob_size = blob_size;
-    result->abi_version = MARGARET_ABI_VERSION;
-    result->reserved = 0u;
+    result = (MARGARET_PING_RESULT *)args->OutputBuffer;
+    result->Header.Magic = MARGARET_RESULT_MAGIC;
+    result->Header.Version = MARGARET_ABI_VERSION;
+    result->Header.Status = (DWORD)MargaretStatusOk;
+    result->Header.PayloadLength =
+        (DWORD)(sizeof(MARGARET_PING_RESULT) - sizeof(MARGARET_RESULT_HEADER));
+    result->Architecture = MARGARET_ARCH_X64;
+    result->BlobSize = blobSize;
+    result->AbiVersion = MARGARET_ABI_VERSION;
+    result->Reserved = 0u;
 
-    args->output_length = (pic_u32)sizeof(MARGARET_PING_RESULT);
-    args->status = (pic_u32)MARGARET_STATUS_OK;
-    return (pic_u32)MARGARET_STATUS_OK;
+    args->OutputLength = (DWORD)sizeof(MARGARET_PING_RESULT);
+    args->Status = (DWORD)MargaretStatusOk;
+    return (DWORD)MargaretStatusOk;
 }
 
 
-PIC_CODE pic_u32 PIC_MS_ABI margaret_main(MARGARET_ARGS *args,
-                                           const pic_u8 *blob_anchor,
-                                           pic_u32 blob_size)
+CODE_SECTION DWORD MS_ABI margaret_main(MARGARET_ARGS *args,
+                                           const BYTE *blobAnchor,
+                                           DWORD blobSize)
 {
-    PIC_CONTEXT context;
-    pic_u32 status;
+    RESOLVER_CONTEXT context;
+    DWORD status;
 
-    if (args == PIC_NULL || blob_anchor == PIC_NULL) {
-        return (pic_u32)MARGARET_STATUS_BAD_ARGUMENT;
+    if (args == NULL || blobAnchor == NULL) {
+        return (DWORD)MargaretStatusBadArgument;
     }
 
-    if (args->size < (pic_u32)sizeof(MARGARET_ARGS)) {
-        return (pic_u32)MARGARET_STATUS_BAD_ARGUMENT;
+    if (args->Size < (DWORD)sizeof(MARGARET_ARGS)) {
+        return (DWORD)MargaretStatusBadArgument;
     }
 
-    if (args->magic != MARGARET_ARGUMENT_MAGIC) {
-        args->status = (pic_u32)MARGARET_STATUS_BAD_MAGIC;
-        return (pic_u32)MARGARET_STATUS_BAD_MAGIC;
+    if (args->Magic != MARGARET_ARGUMENT_MAGIC) {
+        args->Status = (DWORD)MargaretStatusBadMagic;
+        return (DWORD)MargaretStatusBadMagic;
     }
-    if (args->version != MARGARET_ABI_VERSION) {
-        args->status = (pic_u32)MARGARET_STATUS_BAD_VERSION;
-        return (pic_u32)MARGARET_STATUS_BAD_VERSION;
-    }
-
-    if (blob_size == 0u) {
-        args->status = (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
-        return (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
+    if (args->Version != MARGARET_ABI_VERSION) {
+        args->Status = (DWORD)MargaretStatusBadVersion;
+        return (DWORD)MargaretStatusBadVersion;
     }
 
-    (void)margaret_memzero(&context, (pic_size)sizeof(context));
-    context.blob_anchor = blob_anchor;
-    context.blob_size = blob_size;
-    context.argument_block = args;
-    context.api.version = MARGARET_ABI_VERSION;
+    if (blobSize == 0u) {
+        args->Status = (DWORD)MargaretStatusInternalError;
+        return (DWORD)MargaretStatusInternalError;
+    }
 
-    switch ((MARGARET_OPERATION)args->operation) {
-    case MARGARET_OP_PING:
-        status = write_ping_result(args, blob_size);
+    (void)MargaretMemzero(&context, (SIZE_T)sizeof(context));
+    context.BlobAnchor = blobAnchor;
+    context.BlobSize = blobSize;
+    context.ArgumentBlock = args;
+    context.Api.Version = MARGARET_ABI_VERSION;
+
+    switch ((MARGARET_OPERATION)args->Operation) {
+    case MargaretOperationPing:
+        status = WritePingResult(args, blobSize);
         break;
-    case MARGARET_OP_SNAPSHOT_DEFAULT_PROFILE: {
-        void *chrome_base;
-        pic_u32 image_size;
+    case MargaretOperationSnapshotDefaultProfile: {
+        PVOID chromeBase;
+        DWORD imageSize;
         MARGARET_CHROMIUM_ADAPTER adapter;
-        args->flags = 10u; /* progress: dispatch entered */
-        if (margaret_locate_chrome_dll(&context, &chrome_base, &image_size) !=
-            PIC_FALSE) {
-            args->flags = 11u; /* chrome.dll located */
-            if (margaret_select_chromium_adapter(chrome_base, image_size,
-                                                 &adapter) != PIC_FALSE) {
-                args->flags = 12u; /* adapter selected (pinned or discovered) */
-                status = margaret_engine_a_snapshot(&context, &adapter, args);
+        args->Flags = 10u; /* Dispatch entered. */
+        if (MargaretLocateChromeDll(&context, &chromeBase, &imageSize) !=
+            FALSE) {
+            args->Flags = 11u; /* Module located. */
+            if (MargaretSelectChromiumAdapter(chromeBase, imageSize,
+                                                 &adapter) != FALSE) {
+                args->Flags = 12u; /* Adapter selected. */
+                status = MargaretEngineASnapshot(&context, &adapter, args);
             } else {
-                args->status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
-                status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
+                args->Status = (DWORD)MargaretStatusUnsupportedBuild;
+                status = (DWORD)MargaretStatusUnsupportedBuild;
             }
         } else {
-            args->status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
-            status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
+            args->Status = (DWORD)MargaretStatusUnsupportedBuild;
+            status = (DWORD)MargaretStatusUnsupportedBuild;
         }
-        (void)margaret_memzero(&adapter, sizeof(adapter));
+        (void)MargaretMemzero(&adapter, sizeof(adapter));
         break;
     }
-    case MARGARET_OP_NONE:
+    case MargaretOperationNone:
     default:
-        args->status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_OPERATION;
-        status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_OPERATION;
+        args->Status = (DWORD)MargaretStatusUnsupportedOperation;
+        status = (DWORD)MargaretStatusUnsupportedOperation;
         break;
     }
 
-    context.status = status;
-    (void)margaret_memzero(&context, (pic_size)sizeof(context));
+    context.Status = status;
+    (void)MargaretMemzero(&context, (SIZE_T)sizeof(context));
     return status;
 }

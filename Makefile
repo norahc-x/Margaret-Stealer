@@ -22,7 +22,7 @@ HASH_FILE  := $(BIN_DIR)/shellcode.sha256
 TOOL_REPORT := $(INSPECT_DIR)/tool-versions.txt
 MAX_SIZE   := 65536
 
-# Deliberate order: entry first, C implementation next, terminal marker last.
+# Fixed object order: entry, implementation, end marker.
 OBJECTS := \
 	$(OBJ_DIR)/entry_x64.obj \
 	$(OBJ_DIR)/entry.obj \
@@ -59,19 +59,19 @@ $(OBJ_DIR)/entry_x64.obj: asm/entry_x64.s | $(OBJ_DIR)
 $(OBJ_DIR)/end_x64.obj: asm/end_x64.s | $(OBJ_DIR)
 	$(AS) $(ASFLAGS) $< -o $@
 
-$(OBJ_DIR)/entry.obj: src/entry.c include/margaret.h include/pic_resolve.h | $(OBJ_DIR)
+$(OBJ_DIR)/entry.obj: src/entry.c include/margaret.h include/resolve.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/runtime.obj: src/runtime.c include/margaret.h include/pic_resolve.h | $(OBJ_DIR)
+$(OBJ_DIR)/runtime.obj: src/runtime.c include/margaret.h include/resolve.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/resolve.obj: src/resolve.c include/pic_resolve.h | $(OBJ_DIR)
+$(OBJ_DIR)/resolve.obj: src/resolve.c include/resolve.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-$(OBJ_DIR)/adapter.obj: src/adapter.c include/chromium_adapter.h include/pic_resolve.h include/margaret.h | $(OBJ_DIR)
+$(OBJ_DIR)/adapter.obj: src/adapter.c include/chromium_adapter.h include/resolve.h include/margaret.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-$(OBJ_DIR)/engine_a.obj: src/engine_a.c include/margaret.h include/chromium_adapter.h include/pic_resolve.h | $(OBJ_DIR)
+$(OBJ_DIR)/engine_a.obj: src/engine_a.c include/margaret.h include/chromium_adapter.h include/resolve.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-$(OBJ_DIR)/cc_layout.obj: src/cc_layout.c include/cc_layout.h include/pic_resolve.h | $(OBJ_DIR)
+$(OBJ_DIR)/cc_layout.obj: src/cc_layout.c include/cc_layout.h include/resolve.h | $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(TOOL_REPORT): | $(INSPECT_DIR)
@@ -123,7 +123,7 @@ tool-versions: $(TOOL_REPORT)
 
 hash-table:
 	@python3 scripts/hash.py --emit
-	@printf 'regenerated include/pic_hash_table.h — rebuild to pick it up\n'
+	@printf 'regenerated include/hash_table.h — rebuild to pick it up\n'
 
 hash-audit:
 	@python3 scripts/hash.py --audit
@@ -152,7 +152,7 @@ clean:
 
 loader: loader/loader.exe
 
-LOADER_HEADERS := include/margaret.h include/pic_resolve.h include/pic_hash_table.h
+LOADER_HEADERS := include/margaret.h include/resolve.h include/hash_table.h
 
 loader/loader.exe: loader/loader.c loader/lstrings.h $(LOADER_HEADERS)
 	x86_64-w64-mingw32-gcc -O2 -Wall -Iinclude -s -fno-ident -o $@ loader/loader.c
@@ -160,7 +160,7 @@ loader/loader.exe: loader/loader.c loader/lstrings.h $(LOADER_HEADERS)
 
 loader-verbose: loader/loader.c loader/lstrings.h $(LOADER_HEADERS)
 	x86_64-w64-mingw32-gcc -O2 -Wall -Iinclude -DLOADER_VERBOSE -o loader/loader-verbose.exe loader/loader.c
-# loader strings-gate: nessuna stringa rivelatrice nel .exe (quiet build)
+# Reject revealing strings in the quiet loader.
 loader-gate: loader/loader.exe
 	@w=$$(strings -e l loader/loader.exe | grep -icE "chrome|utility|network" || true); \
 	 a=$$(strings loader/loader.exe | grep -icE "loader\]|hijack|MCEA|ntdll|NtQuery|chrome|utility|cookies_" || true); \

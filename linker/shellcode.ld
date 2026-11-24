@@ -24,8 +24,7 @@ SECTIONS
         __margaret_text_end = .;
     }
 
-    /* Any runtime-bearing section here is a build failure.  The verifier also
-     * checks input objects so this section is diagnostic, not a discard path. */
+    /* Collect forbidden runtime sections for verifier rejection. */
     .unexpected ALIGN(16) :
     {
         *(.text)

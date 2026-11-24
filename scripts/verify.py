@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic static gates for the Margaret x64 PIC build."""
+"""Deterministic static gates for the Margaret x64 position-independent build."""
 
 from __future__ import annotations
 

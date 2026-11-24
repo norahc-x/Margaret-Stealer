@@ -7,17 +7,8 @@
 .extern margaret_blob_end
 
 /*
- * Entry precondition: the blob MUST be entered by CALL (RSP % 16 == 8
- * at margaret_entry); the shipped loader trampoline guarantees it.
- * A delivery that JMPs in with RSP % 16 == 0 misaligns every callee
- * and faults on the first aligned SSE access inside resolved code.
- *
- * The C function follows the Windows x64 ABI.  This stub preserves every
- * nonvolatile GPR it touches/potentially exposes and reserves 32 bytes of
- * shadow space plus 8 bytes to align RSP to 16 before CALL.  XMM6-XMM15 are
- * untouched by the stub and are preserved by the conforming C callee.
- * Unwind metadata is deliberately absent; exceptions/unwinding across the
- * blob are unsupported.
+ * CALL entry only: RSP % 16 == 8. Preserve nonvolatile GPRs and reserve
+ * aligned shadow space before C. Unwinding across the blob is unsupported.
  */
 margaret_blob_start:
 margaret_entry:

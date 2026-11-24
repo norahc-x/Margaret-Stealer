@@ -1,15 +1,15 @@
-#define PIC_CODE_SECTION_NAME ".text$C"
+#define CODE_SECTION_NAME ".text$C"
 #include "margaret.h"
 
-PIC_CODE void *PIC_MS_ABI margaret_memzero(void *buffer, pic_size length)
+CODE_SECTION PVOID MS_ABI MargaretMemzero(PVOID buffer, SIZE_T length)
 {
-    volatile pic_u8 *cursor;
+    volatile BYTE *cursor;
 
-    if (buffer == PIC_NULL) {
-        return PIC_NULL;
+    if (buffer == NULL) {
+        return NULL;
     }
 
-    cursor = (volatile pic_u8 *)buffer;
+    cursor = (volatile BYTE *)buffer;
     while (length != 0u) {
         *cursor = 0u;
         ++cursor;
@@ -18,19 +18,19 @@ PIC_CODE void *PIC_MS_ABI margaret_memzero(void *buffer, pic_size length)
     return buffer;
 }
 
-PIC_CODE void *PIC_MS_ABI margaret_memcpy(void *destination,
-                                          const void *source,
-                                          pic_size length)
+CODE_SECTION PVOID MS_ABI MargaretMemcpy(PVOID destination,
+                                          PCVOID source,
+                                          SIZE_T length)
 {
-    pic_u8 *out;
-    const pic_u8 *in;
+    PBYTE out;
+    const BYTE *in;
 
-    if (destination == PIC_NULL || source == PIC_NULL) {
-        return PIC_NULL;
+    if (destination == NULL || source == NULL) {
+        return NULL;
     }
 
-    out = (pic_u8 *)destination;
-    in = (const pic_u8 *)source;
+    out = (PBYTE)destination;
+    in = (const BYTE *)source;
     while (length != 0u) {
         *out = *in;
         ++out;
