@@ -551,7 +551,7 @@ int main(int argc, char **argv) {
     /* Read results. */
     if (!RpRead(proc, (uint64_t)(uintptr_t)rArgs, &back, sizeof(back)))
         Die("read args");
-    DBG("[loader] status=0x%X output_length=%u flags=0x%X pad=0x%X\n",
+    DBG("[loader] status=0x%lX output_length=%lu flags=0x%lX pad=0x%lX\n",
         back.Status, back.OutputLength, back.Flags, back.Pad);
     if (back.Status != 0) {
         uint8_t hdr[32];
